@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 from easyths.core.tonghuashun_automator import TonghuashunAutomator
 from easyths.models.operations import OperationResult, PluginMetadata
-from easyths.utils import captcha_ocr_server
+from easyths.utils import get_captcha_ocr_server
 logger = structlog.get_logger(__name__)
 
 
@@ -457,7 +457,7 @@ class BaseOperation(ABC):
 
     def ocr_captcha(self, control: Any) -> str:
         """根据控件获取OCR验证码结果"""
-        code = captcha_ocr_server.recognize(control)
+        code = get_captcha_ocr_server().recognize(control)
         #同花顺验证码一般是4位，防止出现大于4位的code，这个概率几乎没有
         if len(code) > 4:
             code = code[:4]

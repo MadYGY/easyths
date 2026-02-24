@@ -1,22 +1,21 @@
-import threading
-import structlog
-from .screen_capture import get_mss_instance
-from PIL import Image
-import ddddocr
+import functools
 
-# 线程局部存储 - 每个线程缓存独立的 ddddocr 实例
-_thread_local = threading.local()
+import ddddocr
+import structlog
+from PIL import Image
+
+from .screen_capture import get_mss_instance
+
+
+@functools.lru_cache(maxsize=1)
+def _get_ocr_instance():
+    """获取 ddddocr 实例（全局单例）"""
+    return ddddocr.DdddOcr(show_ad=False)
+
 
 class CaptchaOCR:
     def __init__(self):
         self.logger = structlog.get_logger(__name__)
-
-    def _get_ocr(self):
-        """获取当前线程的 ddddocr 实例（每个线程只创建一次，后续复用）"""
-        if not hasattr(_thread_local, 'ocr'):
-            _thread_local.ocr = ddddocr.DdddOcr(show_ad=False)
-            self.logger.debug(f"线程 {threading.current_thread().name} 创建新的 ddddocr 实例")
-        return _thread_local.ocr
 
     def recognize(self, captcha_control) -> str:
         """识别验证码
@@ -45,8 +44,8 @@ class CaptchaOCR:
             sct_img = get_mss_instance().grab(monitor)
             # 转换为PIL Image
             image = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-            # 获取当前线程的 OCR 实例并识别
-            ocr = self._get_ocr()
+            # 获取 OCR 实例并识别
+            ocr = _get_ocr_instance()
             result = ocr.classification(image)
             return result
 
@@ -54,6 +53,7 @@ class CaptchaOCR:
             self.logger.error(f"验证码识别失败: {e}")
             return ""
 
-captcha_ocr_server = CaptchaOCR()
-def get_captcha_ocr_server():
-    return captcha_ocr_server
+
+@functools.lru_cache(maxsize=1)
+def get_captcha_ocr_server() -> CaptchaOCR:
+    return CaptchaOCR()
