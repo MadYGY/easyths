@@ -31,9 +31,12 @@ class FundsQueryOperation(BaseOperation):
         try:
             self.logger.info(f"执行资金查询操作。")
             # 切换到资金股票菜单
-            self.switch_left_menus("查询[F4]", "资金股票")
+            # self.switch_left_menus("查询[F4]", "资金股票")  #不采用特定子菜单进行定位 https://github.com/noimank/easyths/issues/4
             # 刷新数据
-            self.get_main_window(wrapper_obj=True).type_keys("{F5}")
+            main_window_wrapper = self.get_main_window(wrapper_obj=True)
+            main_window_wrapper.type_keys("{F4}")
+            self.sleep(0.2)
+            main_window_wrapper.type_keys("{F5}")
             # 防抖
             self.sleep(0.3)
             # print(f"切换页面耗时：{time.time() - tt}")
@@ -41,7 +44,6 @@ class FundsQueryOperation(BaseOperation):
             # main_window = self.get_main_window()
             # main_panel = main_window.child_window(auto_id="59649", control_type="Pane", depth=2).wrapper_object()
                  # 改进版：不使用child_window从 1.5s降低到1s
-            main_window_wrapper = self.get_main_window(wrapper_obj=True)
             main_panel = self.get_control_with_children(main_window_wrapper, class_name="AfxMDIFrame140s", control_type="Pane", auto_id="59648").children(class_name='AfxMDIFrame140s')[0]
             # 再进一步筛选
             text_controls = main_panel.children(control_type="Text",class_name="Static")
