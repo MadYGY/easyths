@@ -95,8 +95,12 @@ class SellOperation(BaseOperation):
     def execute(self, params: Dict[str, Any]) -> OperationResult:
         """执行卖出操作"""
         stock_code = params["stock_code"]
-        # 转为 2位小数的字符
-        price =  "{:.2f}".format(float(params["price"]))
+        # 判断代码是否是etf,股票类别和etf类别精度不一致 https://github.com/noimank/easyths/issues/6
+        if stock_code.startswith("5") or stock_code.startswith("1"):
+            price = "{:.3f}".format(float(params["price"]))
+        else:
+            price = "{:.2f}".format(float(params["price"]))
+
         quantity = params["quantity"]
         start_time = time.time()
         try:

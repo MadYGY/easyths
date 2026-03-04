@@ -95,9 +95,15 @@ class ConditionBuyOperation(BaseOperation):
             return False
 
     def execute(self, params: Dict[str, Any]) -> OperationResult:
-        """执行条件买入操作 - TODO: 待实现"""
+        """执行条件买入操作"""
         stock_code = params["stock_code"]
         target_price = params["target_price"]
+        # 判断代码是否是etf,股票类别和etf类别精度不一致 https://github.com/noimank/easyths/issues/6
+        if stock_code.startswith("5") or stock_code.startswith("1"):
+            target_price = "{:.3f}".format(float(target_price))
+        else:
+            target_price = "{:.2f}".format(float(target_price))
+
         quantity = params["quantity"]
         expire_days = params.get("expire_days", 30)
         start_time = time.time()
