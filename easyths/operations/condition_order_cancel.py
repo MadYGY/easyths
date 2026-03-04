@@ -166,9 +166,10 @@ class ConditionOrderCancelOperation(BaseOperation):
                 yes_btn = self.get_control_with_children(confirm_pop, control_type="Button", title="确认")
                 yes_btn.click()
                 is_op_success = True
+                op_message = f"条件单删除成功,删除{delete_count}条记录"
             else:
                 op_message = "没有符合筛选条件的条件单，无法进行删除操作"
-                is_op_success = False
+                is_op_success = True
 
             # 占位实现
             result_data = {
