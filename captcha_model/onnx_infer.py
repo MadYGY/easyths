@@ -21,6 +21,8 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 
+from captcha_model.ctc_decoder import greedy_decode, beam_search_decode
+
 
 class CaptchaRecognizer:
     """
@@ -63,8 +65,8 @@ class CaptchaRecognizer:
         self.seq_len: int = self.input_width // self.downsampling
 
         # Normalization params
-        self.mean: List[float] = json.loads(m.get("mean", "[0.485, 0.456, 0.406]"))
-        self.std: List[float] = json.loads(m.get("std", "[0.229, 0.224, 0.225]"))
+        self.mean: List[float] = json.loads(m.get("mean", "[0.5, 0.5, 0.5]"))
+        self.std: List[float] = json.loads(m.get("std", "[0.5, 0.5, 0.5]"))
 
         # Character mapping
         self.charset_size = len(self.charset)
@@ -103,71 +105,11 @@ class CaptchaRecognizer:
 
     def _greedy_decode(self, probs: np.ndarray) -> List[int]:
         """Greedy CTC decoding."""
-        best_path = np.argmax(probs, axis=1)
-        decoded = []
-        prev = 0
-        for token in best_path:
-            if token != 0 and token != prev:
-                decoded.append(token)
-            prev = token
-        return decoded
+        return greedy_decode(probs, blank=0)
 
     def _beam_search_decode(self, probs: np.ndarray) -> List[int]:
         """Beam search CTC decoding with log-space computation."""
-        import math
-
-        seq_len, num_classes = probs.shape
-        log_probs = np.log(probs + 1e-10)
-        NEG_INF = float("-inf")
-
-        def logsumexp(a: float, b: float) -> float:
-            if a == NEG_INF:
-                return b
-            if b == NEG_INF:
-                return a
-            max_val = max(a, b)
-            return max_val + math.log(1.0 + math.exp(min(a, b) - max_val))
-
-        beam: Dict[Tuple, Tuple[float, float]] = {(): (0.0, NEG_INF)}
-
-        for t in range(seq_len):
-            new_beam: Dict[Tuple, Tuple[float, float]] = {}
-
-            for prefix, (lp_blank, lp_non_blank) in beam.items():
-                lp_b = log_probs[t, 0]
-                new_lp_blank = logsumexp(lp_blank, lp_non_blank) + lp_b
-                if prefix in new_beam:
-                    old_lp_blank, old_lp_non_blank = new_beam[prefix]
-                    new_beam[prefix] = (logsumexp(old_lp_blank, new_lp_blank), old_lp_non_blank)
-                else:
-                    new_beam[prefix] = (new_lp_blank, NEG_INF)
-
-                for c in range(1, num_classes):
-                    lp_c = log_probs[t, c]
-                    if len(prefix) > 0 and prefix[-1] == c:
-                        new_lp_non_blank = lp_blank + lp_c
-                    else:
-                        new_lp_non_blank = logsumexp(lp_blank, lp_non_blank) + lp_c
-
-                    new_prefix = prefix + (c,)
-                    if new_prefix in new_beam:
-                        old_lp_blank, old_lp_non_blank = new_beam[new_prefix]
-                        new_beam[new_prefix] = (
-                            old_lp_blank,
-                            logsumexp(old_lp_non_blank, new_lp_non_blank),
-                        )
-                    else:
-                        new_beam[new_prefix] = (NEG_INF, new_lp_non_blank)
-
-            sorted_beam = sorted(
-                new_beam.items(),
-                key=lambda x: logsumexp(x[1][0], x[1][1]),
-                reverse=True,
-            )[: self.beam_width]
-            beam = {k: v for k, v in sorted_beam}
-
-        best_prefix = max(beam.keys(), key=lambda x: logsumexp(beam[x][0], beam[x][1]))
-        return list(best_prefix)
+        return beam_search_decode(probs, blank=0, beam_width=self.beam_width)
 
     def _decode(self, probs: np.ndarray) -> str:
         """Decode probability matrix to text."""
@@ -215,18 +157,13 @@ class CaptchaRecognizer:
         """Calculate per-character confidence scores."""
         best_path = np.argmax(probs, axis=1)
         confidences = []
-        prev = 0
+        prev = None
         char_idx = 0
 
         for t, token in enumerate(best_path):
-            if token != 0 and token != prev:
-                if char_idx < len(text):
-                    char = text[char_idx]
-                    expected_idx = self.charset.index(char) + 1 if char in self.charset else 0
-                    if token == expected_idx:
-                        confidences.append(float(probs[t, token]))
-                    else:
-                        confidences.append(float(probs[t, token]))
+            if token != prev:
+                if token != 0 and char_idx < len(text):
+                    confidences.append(float(probs[t, token]))
                     char_idx += 1
             prev = token
 
@@ -237,8 +174,33 @@ class CaptchaRecognizer:
         image_paths: List[Union[str, "Image.Image"]],
         return_confidence: bool = False,
     ) -> List[Union[str, Tuple[str, List[float]]]]:
-        """Recognize captcha text from multiple images."""
-        return [self.predict(p, return_confidence) for p in image_paths]
+        """Recognize captcha text from multiple images using batch inference."""
+        if not image_paths:
+            return []
+
+        # Preprocess all images
+        images = []
+        for p in image_paths:
+            if isinstance(p, Image.Image):
+                img = p
+            else:
+                img = Image.open(p)
+            images.append(self._preprocess(img))
+
+        batch = np.stack(images, axis=0)
+        probs: np.ndarray = self.session.run(None, {"input": batch})[0]
+        # Output shape: (T, B, C)
+
+        results = []
+        for i in range(probs.shape[1]):
+            sample_probs = probs[:, i, :]
+            text = self._decode(sample_probs)
+            if return_confidence:
+                confidences = self._get_confidences(sample_probs, text)
+                results.append((text, confidences))
+            else:
+                results.append(text)
+        return results
 
 
 def main():

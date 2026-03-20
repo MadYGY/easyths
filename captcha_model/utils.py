@@ -127,6 +127,15 @@ def ensure_output_dir(output_dir: str) -> Path:
     return path
 
 
+def load_state_dict_from_path(model_path: str, device: "torch.device") -> Dict:
+    """Load model state_dict from either best_model.pth or checkpoint.pth."""
+    import torch
+    data = torch.load(model_path, map_location=device, weights_only=False)
+    if isinstance(data, dict) and "model_state_dict" in data:
+        return data["model_state_dict"]
+    return data
+
+
 def get_device() -> "torch.device":
     """Get the best available device for computation."""
     try:
@@ -135,6 +144,7 @@ def get_device() -> "torch.device":
             return torch.device("cuda")
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
+        return torch.device("cpu")
     except ImportError:
         pass
     return "cpu"

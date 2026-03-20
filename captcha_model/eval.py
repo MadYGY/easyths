@@ -23,21 +23,10 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from captcha_model.utils import load_config, get_device, calculate_ctc_accuracy
+from captcha_model.utils import load_config, get_device, calculate_ctc_accuracy, load_state_dict_from_path
 from captcha_model.dataset import create_dataloader
 from captcha_model.model import CaptchaRecognizer
-
-
-def greedy_decode_ctc(probs: np.ndarray, blank: int = 0) -> List[int]:
-    """Greedy CTC decoding."""
-    best_path = np.argmax(probs, axis=1)
-    decoded = []
-    prev = blank
-    for token in best_path:
-        if token != blank and token != prev:
-            decoded.append(int(token))
-        prev = token
-    return decoded
+from captcha_model.ctc_decoder import greedy_decode, beam_search_decode
 
 
 def evaluate_pytorch(
@@ -45,7 +34,7 @@ def evaluate_pytorch(
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
     decode_method: str = "greedy",
-) -> Tuple[float, float, Dict]:
+) -> Tuple[float, float]:
     """Evaluate PyTorch model."""
     model.eval()
 
@@ -81,7 +70,7 @@ def evaluate_onnx(
     dataloader: torch.utils.data.DataLoader,
     idx_to_char: Dict[int, str],
     decode_method: str = "greedy",
-) -> Tuple[float, float, Dict]:
+) -> Tuple[float, float]:
     """Evaluate ONNX model."""
     all_predictions = []
     all_targets = []
@@ -93,22 +82,16 @@ def evaluate_onnx(
 
         # Run ONNX inference: output is (T, B, C)
         probs = ort_session.run(None, {"input": images_np})[0]
-        # ONNX may have static or dynamic batch in the T dimension
-        # Handle both: (T, B, C) with B>1 OR (T, 1, C) with B=1
-        if probs.shape[1] == 1:
-            probs = probs.squeeze(1)  # (T, C) for single sample
-            probs = probs[None, ...]   # (1, T, C) for uniform loop
-        else:
-            probs = np.transpose(probs, (1, 0, 2))  # (B, T, C)
+        # Transpose to (B, T, C) for per-sample decoding
+        probs = np.transpose(probs, (1, 0, 2))
 
         # Decode each sample in batch
         predictions = []
         for i in range(probs.shape[0]):
             if decode_method == "beam_search":
-                from captcha_model.ctc_decoder import beam_search_decode
                 indices = beam_search_decode(probs[i], blank=0, beam_width=10)
             else:
-                indices = greedy_decode_ctc(probs[i], blank=0)
+                indices = greedy_decode(probs[i], blank=0)
             predictions.append(indices)
 
         target_list = []
@@ -160,21 +143,18 @@ def run_evaluation(
         ort_session = ort.InferenceSession(model_path)
         model = None
     else:
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-
-        if isinstance(checkpoint, dict):
-            model_config = checkpoint.get("config", {}).get("model", config.get("model", {}))
-        else:
-            model_config = config.get("model", {})
+        model_config = config.get("model", {})
 
         model = CaptchaRecognizer(
             charset_size=charset_size,
+            in_channels=config["image"]["channels"],
             dropout=model_config.get("dropout", 0.2),
             hidden_size=model_config.get("hidden_size", 384),
             num_tcn_layers=model_config.get("num_tcn_layers", 4),
         )
 
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        state_dict = load_state_dict_from_path(model_path, device)
+        model.load_state_dict(state_dict)
 
         model.to(device)
         model.eval()

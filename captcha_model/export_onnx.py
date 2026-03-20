@@ -22,7 +22,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from captcha_model.utils import load_config, get_device
+from captcha_model.utils import load_config, get_device, load_state_dict_from_path
 from captcha_model.model import CaptchaRecognizer
 
 
@@ -283,14 +283,14 @@ def run_export(
 
     model = CaptchaRecognizer(
         charset_size=charset_size,
+        in_channels=config["image"]["channels"],
         dropout=model_config.get("dropout", 0.2),
         hidden_size=model_config.get("hidden_size", 384),
         num_tcn_layers=model_config.get("num_tcn_layers", 4),
         kernel_size=model_config.get("kernel_size", 3),
     )
 
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    state_dict = load_state_dict_from_path(model_path, device)
     model.load_state_dict(state_dict)
 
     model.to(device)
@@ -307,8 +307,8 @@ def run_export(
         "input_height": height,
         "input_width": width,
         "channels": channels,
-        "mean": normalization.get("mean", [0.485, 0.456, 0.406]),
-        "std": normalization.get("std", [0.229, 0.224, 0.225]),
+        "mean": normalization.get("mean", [0.5, 0.5, 0.5]),
+        "std": normalization.get("std", [0.5, 0.5, 0.5]),
         "captcha_min_length": config.get("captcha_length", {}).get("min", 4),
         "captcha_max_length": config.get("captcha_length", {}).get("max", 6),
         "downsampling": 8,

@@ -113,7 +113,7 @@ def create_scheduler(
             max_lr=config["training"]["learning_rate"],
             epochs=epochs,
             steps_per_epoch=len(dataloader),
-            pct_start=config["training"].get("warmup_epochs", 5) / epochs,
+            pct_start=min(config["training"].get("warmup_epochs", 5) / epochs, 0.3),
             anneal_strategy='cos',
             div_factor=25.0,
             final_div_factor=10000.0,
@@ -177,7 +177,7 @@ def train_epoch(
         # Only decode periodically to speed up training
         if (batch_idx + 1) % decode_interval == 0 or (batch_idx + 1) == len(dataloader):
             with torch.no_grad():
-                predictions = model.decode(images, blank=0, method="greedy")
+                predictions = model.decode(images, blank=0, method="greedy", log_probs=outputs.detach())
 
             target_list = []
             offset = 0
@@ -243,7 +243,8 @@ def validate_epoch(
         outputs = model(images)
         loss = criterion(outputs, targets, input_lengths, target_lengths)
 
-        predictions = model.decode(images, blank=0, method="greedy")
+        # Reuse outputs for decoding — no duplicate forward pass
+        predictions = model.decode(images, blank=0, method="greedy", log_probs=outputs)
 
         target_list = []
         offset = 0
@@ -264,10 +265,16 @@ def validate_epoch(
 
 def save_checkpoint(
     model: nn.Module,
+    optimizer: optim.Optimizer,
+    best_seq_accuracy: float,
     output_path: str,
 ) -> None:
-    """Save model weights only."""
-    torch.save(model.state_dict(), output_path)
+    """Save training state for resuming (model + optimizer + best accuracy)."""
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_seq_accuracy": best_seq_accuracy,
+    }, output_path)
 
 
 def save_best_model(
@@ -281,9 +288,17 @@ def save_best_model(
     print(f"  Best model saved (epoch {epoch}, seq_acc={seq_acc:.4f})")
 
 
-def load_weights(model: nn.Module, weights_path: str, device: torch.device) -> None:
-    """Load model weights only."""
-    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+def load_checkpoint(
+    checkpoint_path: str,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+) -> float:
+    """Load training checkpoint. Returns best_seq_accuracy."""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return checkpoint["best_seq_accuracy"]
 
 
 def train(config: Dict) -> CaptchaRecognizer:
@@ -297,6 +312,7 @@ def train(config: Dict) -> CaptchaRecognizer:
     # Create model
     model = CaptchaRecognizer(
         charset_size=charset_size,
+        in_channels=config["image"]["channels"],
         dropout=config["model"]["dropout"],
         hidden_size=config["model"]["hidden_size"],
         num_tcn_layers=config["model"]["num_tcn_layers"],
@@ -332,7 +348,6 @@ def train(config: Dict) -> CaptchaRecognizer:
     best_val_seq_accuracy = 0.0
     best_model_path = output_dir / "best_model.pth"
     checkpoint_path = output_dir / "checkpoint.pth"
-    start_epoch = 1
 
     # Initialize early stopping
     early_stopping_config = config["training"].get("early_stopping", {})
@@ -345,20 +360,23 @@ def train(config: Dict) -> CaptchaRecognizer:
         )
         print(f"Early stopping enabled: patience={early_stopping.patience}, min_delta={early_stopping.min_delta}")
 
-    # Load existing weights if available
-    if best_model_path.exists():
-        print(f"\nFound existing best model: {best_model_path}")
-        load_weights(model, str(best_model_path), device)
-        print("  Loaded model weights, starting fresh")
+    # Load checkpoint weights if available (always train from epoch 1)
+    if checkpoint_path.exists():
+        print(f"\nFound existing checkpoint: {checkpoint_path}")
+        best_seq_accuracy = load_checkpoint(
+            str(checkpoint_path), model, optimizer, device
+        )
+        best_val_seq_accuracy = best_seq_accuracy
+        print(f"  Loaded weights, best_acc={best_seq_accuracy:.4f}")
 
     # Decode interval - decode every N batches for efficiency
     decode_interval = max(1, len(train_loader) // 10)  # ~10 times per epoch
 
-    print(f"\nStarting training from epoch {start_epoch} to {epochs}...")
+    print(f"\nStarting training for {epochs} epochs...")
     print(f"Decode interval: every {decode_interval} batches")
     start_time = time.time()
 
-    for epoch in range(start_epoch, epochs + 1):
+    for epoch in range(1, epochs + 1):
         epoch_start = time.time()
 
         avg_loss, char_acc, seq_acc = train_epoch(
@@ -384,7 +402,7 @@ def train(config: Dict) -> CaptchaRecognizer:
             log_msg += f", val_loss={val_loss:.4f}, val_char_acc={val_char_acc:.4f}, val_seq_acc={val_seq_acc:.4f}"
 
             # Save best model based on validation accuracy
-            if val_seq_acc > best_val_seq_accuracy:
+            if val_seq_acc >= best_val_seq_accuracy and (val_seq_acc > 0 or epoch == 1):
                 best_val_seq_accuracy = val_seq_acc
                 save_best_model(model, epoch, val_seq_acc, str(best_model_path))
 
@@ -398,7 +416,7 @@ def train(config: Dict) -> CaptchaRecognizer:
                     break
         else:
             # Fallback to training accuracy if no validation set
-            if epoch == start_epoch or seq_acc > best_seq_accuracy:
+            if epoch == 1 or seq_acc > best_seq_accuracy:
                 best_seq_accuracy = seq_acc
                 save_best_model(model, epoch, seq_acc, str(best_model_path))
 
@@ -408,10 +426,12 @@ def train(config: Dict) -> CaptchaRecognizer:
         # Save checkpoint every N epochs
         checkpoint_interval = config["training"].get("checkpoint_interval", 5)
         if epoch % checkpoint_interval == 0:
-            save_checkpoint(model, str(checkpoint_path))
+            current_best = best_val_seq_accuracy if val_loader is not None else best_seq_accuracy
+            save_checkpoint(model, optimizer, current_best, str(checkpoint_path))
 
     # Save final checkpoint
-    save_checkpoint(model, str(checkpoint_path))
+    current_best = best_val_seq_accuracy if val_loader is not None else best_seq_accuracy
+    save_checkpoint(model, optimizer, current_best, str(checkpoint_path))
 
     total_time = time.time() - start_time
     print(f"\nTraining completed in {total_time / 60:.1f} minutes")

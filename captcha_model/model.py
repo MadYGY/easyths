@@ -5,14 +5,14 @@ Architecture: VGG-style CNN backbone + Temporal Convolutional Network + CTC
 Fully GPU-optimized, no LSTM, AMD 7900 XTX friendly.
 
 Key design:
-- VGG-style CNN: Efficient spatial feature extraction
+- VGG-style CNN: Efficient spatial feature extraction with SE blocks
 - TCN: Parallelizable temporal modeling with dilated convolutions
-- LayerNorm: Training stability (replaces BatchNorm for 1D)
-- WeightNorm: Stabilizes gradient flow
+- GroupNorm: Training stability, ONNX-compatible (replaces LayerNorm/BatchNorm for 1D)
+- Gated convolution: WaveNet-style gating with proper bias initialization
 - CTC: Sequence-level loss for variable-length output
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -39,6 +39,25 @@ class ConvBNReLU(nn.Module):
         return self.relu(self.bn(self.conv(x)))
 
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation block for channel attention."""
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, mid, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, channels, 1, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.fc(self.pool(x))
+        return x * w
+
+
 class TemporalBlock(nn.Module):
     """
     Temporal block with causal dilated convolution.
@@ -63,7 +82,12 @@ class TemporalBlock(nn.Module):
             stride=stride, padding=padding, dilation=dilation, bias=True
         )
 
-        self.bn = nn.BatchNorm1d(out_channels * 2)
+        # GroupNorm on signal branch only (ONNX-compatible, no gate interference)
+        num_groups = min(32, out_channels)
+        # Ensure out_channels is divisible by num_groups
+        while out_channels % num_groups != 0:
+            num_groups -= 1
+        self.signal_norm = nn.GroupNorm(num_groups, out_channels)
         self.dropout = nn.Dropout(dropout)
 
         # Residual connection
@@ -72,8 +96,8 @@ class TemporalBlock(nn.Module):
         else:
             self.residual = nn.Identity()
 
-        # Initialize gate bias to be slightly positive (encourages gating open at start)
-        nn.init.constant_(self.conv.bias[out_channels:], 1.0)
+        # Initialize gate bias positive so sigmoid starts near 1 (gate open)
+        nn.init.constant_(self.conv.bias[:out_channels], 1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -85,12 +109,18 @@ class TemporalBlock(nn.Module):
         residual = self.residual(x)
 
         out = self.conv(x)
-        out = self.bn(out)
+
+        # Split into gate and signal branches
+        half = out.size(1) // 2
+        gate_input = out[:, :half, :]
+        signal_input = out[:, half:, :]
+
+        # Normalize signal branch only (GroupNorm works on (B, C, T) directly)
+        signal_input = self.signal_norm(signal_input)
 
         # Gated activation
-        # conv outputs [B, 2*C, T], split into input and forget gates
-        gates = torch.sigmoid(out[:, :out.size(1) // 2, :])
-        signals = torch.tanh(out[:, out.size(1) // 2:, :])
+        gates = torch.sigmoid(gate_input)
+        signals = torch.tanh(signal_input)
 
         out = gates * signals
         out = self.dropout(out)
@@ -99,7 +129,8 @@ class TemporalBlock(nn.Module):
         if out.size(2) > residual.size(2):
             out = out[:, :, :residual.size(2)]
 
-        return F.relu(out + residual)
+        # No ReLU after residual — gating already provides nonlinearity
+        return out + residual
 
 
 class TCNStack(nn.Module):
@@ -150,6 +181,7 @@ class CaptchaRecognizer(nn.Module):
     def __init__(
         self,
         charset_size: int,
+        in_channels: int = 3,
         dropout: float = 0.2,
         hidden_size: int = 384,
         num_tcn_layers: int = 4,
@@ -160,9 +192,10 @@ class CaptchaRecognizer(nn.Module):
         self.charset_size = charset_size
         self.num_classes = charset_size + 1  # +1 for CTC blank
         self.hidden_size = hidden_size
+        self.in_channels = in_channels
 
-        # CNN backbone: 8x downsampling
-        self.backbone = self._build_backbone()
+        # CNN backbone: 8x downsampling with SE attention
+        self.backbone = self._build_backbone(in_channels)
 
         # Project CNN features -> TCN hidden
         self.proj = nn.Sequential(
@@ -180,8 +213,11 @@ class CaptchaRecognizer(nn.Module):
             dropout=dropout,
         )
 
-        # Final normalization
-        self.final_norm = nn.LayerNorm(hidden_size)
+        # Final normalization (GroupNorm for ONNX compatibility)
+        num_groups = min(32, hidden_size)
+        while hidden_size % num_groups != 0:
+            num_groups -= 1
+        self.final_norm = nn.GroupNorm(num_groups, hidden_size)
 
         # Classifier
         self.classifier = nn.Sequential(
@@ -194,14 +230,14 @@ class CaptchaRecognizer(nn.Module):
 
         self._init_weights()
 
-    def _build_backbone(self) -> nn.Module:
-        """Build VGG-style backbone with 8x downsampling."""
+    def _build_backbone(self, in_channels: int) -> nn.Module:
+        """Build VGG-style backbone with 8x downsampling and SE attention."""
         class Backbone(nn.Module):
             def __init__(self):
                 super().__init__()
-                # 3 -> 64, stride 2
+                # in_channels -> 64, stride 2
                 self.conv1 = nn.Sequential(
-                    ConvBNReLU(3, 64, 3, 2, 1),   # H/2, W/2
+                    ConvBNReLU(in_channels, 64, 3, 2, 1),   # H/2, W/2
                     ConvBNReLU(64, 64, 3, 1, 1),
                 )
                 # 64 -> 128, stride 2
@@ -209,18 +245,18 @@ class CaptchaRecognizer(nn.Module):
                     ConvBNReLU(64, 128, 3, 2, 1),  # H/4, W/4
                     ConvBNReLU(128, 128, 3, 1, 1),
                 )
-                # 128 -> 256, stride 2
+                # 128 -> 256, stride 2 + SE
                 self.conv3 = nn.Sequential(
                     ConvBNReLU(128, 256, 3, 2, 1),  # H/8, W/8
                     ConvBNReLU(256, 256, 3, 1, 1),
                     ConvBNReLU(256, 256, 3, 1, 1),
+                    SEBlock(256, reduction=16),
                 )
-                # 256 -> 512, spatial pool
+                # 256 -> 512, spatial pool + SE
                 self.conv4 = nn.Sequential(
                     ConvBNReLU(256, 512, 3, 1, 1),
                     ConvBNReLU(512, 512, 3, 1, 1),
-                    nn.BatchNorm2d(512),
-                    nn.ReLU(inplace=True),
+                    SEBlock(512, reduction=16),
                     nn.AdaptiveAvgPool2d((1, None)),  # H -> 1
                 )
                 self.out_channels = 512
@@ -235,26 +271,35 @@ class CaptchaRecognizer(nn.Module):
         return Backbone()
 
     def _init_weights(self):
+        # Collect TCN gated conv modules to skip their bias init
+        tcn_gated_convs = set()
+        for block in self.tcn.blocks:
+            tcn_gated_convs.add(block.conv)
+
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Conv1d)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
+                if m in tcn_gated_convs:
+                    # Gated conv uses tanh+sigmoid, xavier is more appropriate
+                    nn.init.xavier_uniform_(m.weight)
+                    # Bias already initialized in TemporalBlock.__init__
+                else:
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_features: bool = False) -> torch.Tensor:
         """
         Args:
-            x: (B, 3, H, W) input images
+            x: (B, C, H, W) input images
+            return_features: If True, return (log_probs, features) for reuse
         Returns:
             (T, B, num_classes) log probabilities for CTC
+            or ((T, B, num_classes), features) if return_features=True
         """
-        # CNN: (B, 3, H, W) -> (B, 512, 1, W/8)
+        # CNN: (B, C, H, W) -> (B, 512, 1, W/8)
         conv = self.backbone(x)
         b, c, h, _ = conv.size()
         assert h == 1, f"Expected H=1, got H={h}"
@@ -268,12 +313,8 @@ class CaptchaRecognizer(nn.Module):
         # TCN: (B, hidden, W/8) -> (B, hidden, W/8)
         seq = self.tcn(seq)
 
-        # LayerNorm: (B, hidden, W/8) -> (B, W/8, hidden)
-        seq = seq.permute(0, 2, 1)  # (B, T, C)
+        # GroupNorm: (B, hidden, W/8) — works directly on channel dim
         seq = self.final_norm(seq)
-
-        # Back to (B, hidden, T) for conv classifier
-        seq = seq.permute(0, 2, 1)  # (B, C, T)
 
         # Classify: (B, hidden, T) -> (B, num_classes, T)
         logits = self.classifier(seq)
@@ -281,17 +322,29 @@ class CaptchaRecognizer(nn.Module):
         # log_softmax over classes, CTC expects (T, B, C)
         log_probs = F.log_softmax(logits, dim=1).permute(2, 0, 1)
 
+        if return_features:
+            return log_probs, seq
         return log_probs
 
-    def decode(self, x: torch.Tensor, blank: int = 0, method: str = "greedy") -> List[List[int]]:
-        """Decode images to character sequences."""
-        self.eval()
+    def decode(self, x: torch.Tensor, blank: int = 0, method: str = "greedy", log_probs: Optional[torch.Tensor] = None) -> List[List[int]]:
+        """Decode images to character sequences.
+
+        Args:
+            x: Input images (used only if log_probs is None).
+            blank: CTC blank index.
+            method: Decoding method ("greedy" or "beam_search").
+            log_probs: Pre-computed log probabilities (T, B, C) to skip forward pass.
+
+        Note:
+            Caller is responsible for setting model to eval mode before calling this method.
+        """
         with torch.no_grad():
-            output = self.forward(x)
+            if log_probs is None:
+                log_probs = self.forward(x)
             if method == "greedy":
-                return self._greedy_decode(output, blank)
+                return self._greedy_decode(log_probs, blank)
             elif method == "beam_search":
-                return self._beam_search_decode(output, blank)
+                return self._beam_search_decode(log_probs, blank)
             else:
                 raise ValueError(f"Unknown decode method: {method}")
 
@@ -349,9 +402,9 @@ def load_model(
         from captcha_model.utils import get_device
         device = get_device()
 
+    from captcha_model.utils import load_state_dict_from_path
     model = CaptchaRecognizer(charset_size=charset_size, **kwargs)
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    state_dict = load_state_dict_from_path(model_path, device)
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
@@ -364,7 +417,7 @@ def count_parameters(model: nn.Module) -> int:
 
 
 if __name__ == "__main__":
-    model = CaptchaRecognizer(charset_size=62, hidden_size=384, num_tcn_layers=4)
+    model = CaptchaRecognizer(charset_size=62, in_channels=3, hidden_size=384, num_tcn_layers=4)
     print(f"Parameters: {count_parameters(model):,}")
 
     x = torch.randn(2, 3, 64, 160)
@@ -387,7 +440,7 @@ if __name__ == "__main__":
 
     # Timing test
     import time
-    model = CaptchaRecognizer(charset_size=62, hidden_size=384)
+    model = CaptchaRecognizer(charset_size=62, in_channels=3, hidden_size=384)
     x = torch.randn(32, 3, 64, 160)
     model.eval()
     with torch.no_grad():
@@ -397,4 +450,4 @@ if __name__ == "__main__":
     with torch.no_grad():
         for _ in range(100):
             _ = model(x)
-    print(f"Inference: {100 * (time.time() - t0) / 100 * 1000:.1f}ms/image")
+    print(f"Inference: {(time.time() - t0) / 100 / 32 * 1000:.1f}ms/image")

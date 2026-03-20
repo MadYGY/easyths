@@ -25,7 +25,8 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from captcha_model.utils import load_config, get_device
+from captcha_model.utils import load_config, get_device, load_state_dict_from_path
+from captcha_model.ctc_decoder import greedy_decode, beam_search_decode
 
 
 class CaptchaPredictor:
@@ -63,21 +64,19 @@ class CaptchaPredictor:
         from captcha_model.model import CaptchaRecognizer
 
         self.device = get_device()
-        checkpoint = torch.load(model_path, map_location=self.device, weights_only=True)
-
-        # Get model config
         model_config = self.config.get("model", {})
-
         charset_size = len(self.charset)
+
         self.model = CaptchaRecognizer(
             charset_size=charset_size,
+            in_channels=self.config["image"]["channels"],
             dropout=model_config.get("dropout", 0.2),
             hidden_size=model_config.get("hidden_size", 384),
             num_tcn_layers=model_config.get("num_tcn_layers", 4),
         )
 
-        self.model.load_state_dict(checkpoint)
-
+        state_dict = load_state_dict_from_path(model_path, self.device)
+        self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()
 
@@ -116,28 +115,20 @@ class CaptchaPredictor:
         # Convert to numpy and normalize to [0, 1]
         image_array = np.array(image, dtype=np.float32) / 255.0
 
-        # Apply ImageNet normalization for 3-channel images
+        # Apply normalization from config
+        norm_config = self.config.get("preprocessing", {}).get("normalization", {})
+        mean = np.array(norm_config.get("mean", [0.5, 0.5, 0.5]), dtype=np.float32)
+        std = np.array(norm_config.get("std", [0.5, 0.5, 0.5]), dtype=np.float32)
+
         if channels == 3:
-            imagenet_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-            imagenet_std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-            image_array = (image_array - imagenet_mean) / imagenet_std
+            image_array = (image_array - mean) / std
             # Transpose to (C, H, W)
             image_array = np.transpose(image_array, (2, 0, 1))
         else:
+            image_array = (image_array - mean[0]) / std[0]
             image_array = np.expand_dims(image_array, 0)
 
         return image_array
-
-    def _greedy_decode_ctc(self, probs: np.ndarray, blank: int = 0) -> List[int]:
-        """Greedy CTC decoding."""
-        best_path = np.argmax(probs, axis=1)
-        decoded = []
-        prev = blank
-        for token in best_path:
-            if token != blank and token != prev:
-                decoded.append(token)
-            prev = token
-        return decoded
 
     def _decode_output(self, indices: List[int]) -> str:
         """Decode model output indices to string."""
@@ -172,13 +163,13 @@ class CaptchaPredictor:
 
         with torch.no_grad():
             log_output = self.model(image_tensor)
-            probs = torch.exp(log_output).squeeze(1).cpu().numpy()
+            # Model output: (T, B, C), take batch index 0 -> (T, C)
+            probs = torch.exp(log_output)[:, 0, :].cpu().numpy()
 
             if self.decode_method == "beam_search":
-                from captcha_model.ctc_decoder import beam_search_decode
                 indices = beam_search_decode(probs, blank=0, beam_width=10)
             else:
-                indices = self._greedy_decode_ctc(probs, blank=0)
+                indices = greedy_decode(probs, blank=0)
 
             text = self._decode_output(indices)
 
@@ -195,13 +186,13 @@ class CaptchaPredictor:
     ) -> Tuple[str, Optional[List[float]]]:
         """Run ONNX inference."""
         probs = self.ort_session.run(None, {"input": np.expand_dims(image, 0)})[0]
-        probs = probs.squeeze(1)
+        # ONNX output: (T, B, C), take batch index 0 -> (T, C)
+        probs = probs[:, 0, :]
 
         if self.decode_method == "beam_search":
-            from captcha_model.ctc_decoder import beam_search_decode
             indices = beam_search_decode(probs, blank=0, beam_width=10)
         else:
-            indices = self._greedy_decode_ctc(probs, blank=0)
+            indices = greedy_decode(probs, blank=0)
 
         text = self._decode_output(indices)
 
@@ -224,13 +215,12 @@ class CaptchaPredictor:
         """
         best_path = np.argmax(probs, axis=1)
         confidences = []
-        prev = 0
+        prev = None
         conf_idx = 0
 
         for t, token in enumerate(best_path):
-            if token != 0 and token != prev:
-                if token in self.idx_to_char and conf_idx < len(indices):
-                    # Use the actual timestep probability for this token
+            if token != prev:
+                if token != 0 and conf_idx < len(indices):
                     confidences.append(float(probs[t, token]))
                     conf_idx += 1
             prev = token
@@ -242,8 +232,50 @@ class CaptchaPredictor:
         image_paths: List[str],
         return_confidence: bool = False,
     ) -> List[Union[str, Tuple[str, List[float]]]]:
-        """Predict captcha text for multiple images."""
-        return [self.predict(path, return_confidence) for path in image_paths]
+        """Predict captcha text for multiple images using true batch inference."""
+        if not image_paths:
+            return []
+
+        images = np.stack([self._preprocess_image(p) for p in image_paths], axis=0)
+
+        if self.use_onnx:
+            probs = self.ort_session.run(None, {"input": images})[0]
+            # (T, B, C) -> per-sample decode
+            results = []
+            for i in range(probs.shape[1]):
+                sample_probs = probs[:, i, :]
+                if self.decode_method == "beam_search":
+                    indices = beam_search_decode(sample_probs, blank=0, beam_width=10)
+                else:
+                    indices = greedy_decode(sample_probs, blank=0)
+                text = self._decode_output(indices)
+                if return_confidence:
+                    confidences = self._get_confidences(sample_probs, indices)
+                    results.append((text, confidences))
+                else:
+                    results.append(text)
+            return results
+        else:
+            import torch
+            images_tensor = torch.from_numpy(images).to(self.device)
+            with torch.no_grad():
+                log_output = self.model(images_tensor)
+                probs = torch.exp(log_output).cpu().numpy()  # (T, B, C)
+
+            results = []
+            for i in range(probs.shape[1]):
+                sample_probs = probs[:, i, :]
+                if self.decode_method == "beam_search":
+                    indices = beam_search_decode(sample_probs, blank=0, beam_width=10)
+                else:
+                    indices = greedy_decode(sample_probs, blank=0)
+                text = self._decode_output(indices)
+                if return_confidence:
+                    confidences = self._get_confidences(sample_probs, indices)
+                    results.append((text, confidences))
+                else:
+                    results.append(text)
+            return results
 
 
 def main():

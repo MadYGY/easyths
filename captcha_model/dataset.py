@@ -203,10 +203,6 @@ class CaptchaDataset:
         self.labels: List[str] = []
         self._scan_directory()
 
-        self.indices = list(range(len(self.image_files)))
-        if is_training:
-            random.shuffle(self.indices)
-
     def _scan_directory(self) -> None:
         """Scan directory for valid captcha images."""
         if not self.data_dir.exists():
@@ -229,8 +225,7 @@ class CaptchaDataset:
         return len(self.image_files)
 
     def __getitem__(self, idx: int) -> Tuple[np.ndarray, str]:
-        real_idx = self.indices[idx]
-        image = Image.open(self.image_files[real_idx])
+        image = Image.open(self.image_files[idx])
 
         if self.channels == 3:
             if image.mode != "RGB":
@@ -239,7 +234,12 @@ class CaptchaDataset:
             if image.mode != "L":
                 image = image.convert("L")
 
-        # Apply augmentation if enabled (only for training)
+        image = image.resize(
+            (self.target_width, self.target_height),
+            Image.Resampling.BILINEAR
+        )
+
+        # Apply augmentation after resize so pixel-level ops (noise, blur) have consistent effect
         if self.is_training and self.augmentation_config and self.augmentation_config.get("enabled", False):
             image = augment_image(
                 image,
@@ -257,17 +257,12 @@ class CaptchaDataset:
                 elastic_prob=self.augmentation_config.get("elastic_prob", 0.2),
             )
 
-        image = image.resize(
-            (self.target_width, self.target_height),
-            Image.Resampling.BILINEAR
-        )
-
         image_array = np.array(image, dtype=np.float32)
 
         if self.transform is not None:
             image_array = self.transform(image_array)
 
-        label = self.labels[real_idx]
+        label = self.labels[idx]
         return image_array, label
 
 
@@ -276,9 +271,9 @@ class TorchCaptchaDataset(CaptchaDataset):
     PyTorch-compatible captcha dataset for CTC training.
     """
 
-    # Default ImageNet normalization
-    IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    # Default normalization for captcha images
+    IMAGENET_MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+    IMAGENET_STD = np.array([0.5, 0.5, 0.5], dtype=np.float32)
 
     def __init__(self, *args, mean: Optional[np.ndarray] = None, std: Optional[np.ndarray] = None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -329,7 +324,9 @@ def ctc_collate_fn(batch: List[Tuple]) -> Tuple:
     target_lengths = torch.tensor(label_lengths, dtype=torch.long)
 
     _, _, H, W = images.shape
-    seq_len = W // 8  # CRNN backbone: conv1(pool2,2) + conv2(pool2,2) + conv3(pool2,2) = 8x
+    # Backbone uses 3 stride-2 conv stages = 8x width downsampling.
+    # WARNING: if backbone architecture changes, this must be updated to match.
+    seq_len = W // 8
     input_lengths = torch.full((images.size(0),), seq_len, dtype=torch.long)
 
     return images, targets, input_lengths, target_lengths
@@ -353,8 +350,8 @@ def create_dataloader(
 
     # Get custom normalization if provided
     norm_config = config.get("preprocessing", {}).get("normalization", {})
-    mean = np.array(norm_config.get("mean", [0.485, 0.456, 0.406]), dtype=np.float32)
-    std = np.array(norm_config.get("std", [0.229, 0.224, 0.225]), dtype=np.float32)
+    mean = np.array(norm_config.get("mean", [0.5, 0.5, 0.5]), dtype=np.float32)
+    std = np.array(norm_config.get("std", [0.5, 0.5, 0.5]), dtype=np.float32)
 
     dataset = TorchCaptchaDataset(
         data_dir=data_dir,
