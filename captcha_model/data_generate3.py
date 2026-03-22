@@ -36,22 +36,21 @@ def generate_ths_captcha(output_dir="./", code=None):
     width, height = random.randint(100, 146) , random.randint(36, 64)
     img = Image.new('RGB', (width, height), (255, 255, 255))
 
-    # 3. 加载字体（优先使用系统无衬线粗体）
+    # 3. 从fonts目录随机加载字体
     font_path = None
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    fonts_dir = os.path.join(script_dir, "fonts")
+
     try:
-        font_paths = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/System/Library/Fonts/Helvetica.ttc",
-            "C:/Windows/Fonts/arialbd.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
-        ]
-        font = ImageFont.load_default()
-        for fp in font_paths:
-            if os.path.exists(fp):
-                font_path = fp
-                font = ImageFont.truetype(fp, 30)
-                break
-    except:
+        # 获取fonts目录下所有字体文件
+        font_files = [f for f in os.listdir(fonts_dir)
+                      if f.lower().endswith(('.ttf', '.otf', '.ttc'))]
+        if font_files:
+            font_path = os.path.join(fonts_dir, random.choice(font_files))
+            font = ImageFont.truetype(font_path, 30)
+        else:
+            font = ImageFont.load_default()
+    except Exception:
         font = ImageFont.load_default()
 
     # 4. 绘制4个字符
