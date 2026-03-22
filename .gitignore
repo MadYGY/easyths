@@ -147,4 +147,5 @@ AGENTS.md
 
 captcha_model/data
 captcha_model/outputs
+captcha_model/onnx_model
 

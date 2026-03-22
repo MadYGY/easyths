@@ -1,6 +1,9 @@
 """
 Export Captcha Recognition Model to ONNX Format.
 
+All necessary parameters (character set, image size) are embedded into the ONNX
+model metadata, so inference only requires the ONNX file without external config.
+
 Usage:
     python export_onnx.py                    # Export with default config
     python export_onnx.py --model path/to/model.pt  # Export specific model
@@ -22,6 +25,7 @@ warnings.filterwarnings('ignore')
 import argparse
 import yaml
 import torch
+import onnx
 import onnxruntime as ort
 
 from models.resnet_ocr import ResNetOCR
@@ -116,6 +120,25 @@ def main():
             dynamic_axes=None,
             training=torch.onnx.TrainingMode.EVAL
         )
+
+        # Add metadata to ONNX model
+        onnx_model = onnx.load(str(output_path))
+
+        # Embed inference parameters into model metadata
+        meta = onnx_model.metadata_props.add()
+        meta.key = "character"
+        meta.value = character
+
+        meta = onnx_model.metadata_props.add()
+        meta.key = "img_h"
+        meta.value = str(img_h)
+
+        meta = onnx_model.metadata_props.add()
+        meta.key = "img_w"
+        meta.value = str(img_w)
+
+        onnx.save(onnx_model, str(output_path))
+        print(f"  Metadata embedded: character({len(character)} chars), img_h={img_h}, img_w={img_w}")
 
         # Verify
         session = ort.InferenceSession(str(output_path))

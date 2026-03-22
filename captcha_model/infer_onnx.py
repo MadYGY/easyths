@@ -1,8 +1,12 @@
 """
 ONNX Inference Script for Captcha Recognition.
 
+All inference parameters (character set, image size) are read from ONNX model
+metadata, so no external config file is needed.
+
 Usage:
     python infer_onnx.py                           # Run on test images
+    python infer_onnx.py --model model.onnx        # Use specific model
     python infer_onnx.py --image captcha.png       # Test single image
     python infer_onnx.py --dir data/test           # Test directory
     python infer_onnx.py --benchmark               # Run benchmark
@@ -14,21 +18,19 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import cv2
 import numpy as np
+import onnx
 import onnxruntime as ort
-import yaml
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ONNX Captcha Recognition")
 
-    parser.add_argument("--config", type=str, default="config.yaml",
-                        help="Config file path")
     parser.add_argument("--model", type=str, default="onnx_model/captcha_ocr.onnx",
-                        help="ONNX model path")
+                        help="ONNX model path (all params embedded)")
     parser.add_argument("--image", type=str, default=None,
                         help="Single image path")
     parser.add_argument("--dir", type=str, default=None,
@@ -48,17 +50,24 @@ def parse_args():
 
 
 class ONNXCaptchaRecognizer:
-    """ONNX-based captcha recognizer."""
+    """ONNX-based captcha recognizer with self-contained parameters."""
 
-    def __init__(self, model_path: str, config: dict):
-        global_cfg = config.get('Global', {})
+    def __init__(self, model_path: str, provider: str = "CPUExecutionProvider"):
+        # Load ONNX model and extract metadata
+        onnx_model = onnx.load(model_path)
+        metadata = {p.key: p.value for p in onnx_model.metadata_props}
 
-        self.character = global_cfg.get('character', "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
-        self.img_h = global_cfg.get('img_h', 64)
-        self.img_w = global_cfg.get('img_w', 256)
+        # Read parameters from model metadata
+        self.character = metadata.get(
+            "character",
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        )
+        self.img_h = int(metadata.get("img_h", 64))
+        self.img_w = int(metadata.get("img_w", 256))
         self.blank = len(self.character)
 
-        providers = [self._get_provider(config.get('providers', 'CPUExecutionProvider'))]
+        # Create inference session
+        providers = [self._get_provider(provider)]
         self.session = ort.InferenceSession(model_path, providers=providers)
         self.input_name = self.session.get_inputs()[0].name
 
@@ -133,28 +142,21 @@ def run_benchmark(recognizer: ONNXCaptchaRecognizer, warmup: int, iterations: in
 def main():
     args = parse_args()
 
-    # Load config
-    with open(args.config, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-
-    # Update provider from args
-    config['providers'] = args.providers
-
     # Create output directory
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 60)
-    print("ONNX Captcha Recognition")
+    print("ONNX Captcha Recognition (Self-Contained Model)")
     print("=" * 60)
 
-    # Load model
+    # Load model (all params embedded in model metadata)
     model_path = Path(args.model)
     if not model_path.exists():
         print(f"Model not found: {model_path}")
         return
 
-    recognizer = ONNXCaptchaRecognizer(str(model_path), config)
+    recognizer = ONNXCaptchaRecognizer(str(model_path), args.providers)
 
     # Benchmark mode
     if args.benchmark:
