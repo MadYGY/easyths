@@ -84,8 +84,12 @@ class TrainConfig:
         # Training settings
         self.batch_size = train_cfg.get('batch_size', 32)
         self.num_workers = train_cfg.get('num_workers', 0)
-        self.amp = train_cfg.get('amp', False)
         self.save_interval = train_cfg.get('save_interval', 20)
+
+        # Early stopping settings
+        early_stopping_cfg = train_cfg.get('early_stopping', {})
+        self.early_stopping_patience = early_stopping_cfg.get('patience', 20)
+        self.early_stopping_min_delta = early_stopping_cfg.get('min_delta', 0.001)
 
         # Dataset settings
         self.train_dir = dataset_cfg.get('train_dir', 'data/train')
@@ -112,7 +116,8 @@ class TrainConfig:
             f"Train dir: {self.train_dir}",
             f"Val dir: {self.val_dir}",
             "-" * 60,
-            f"AMP: {self.amp}",
+            f"Early stopping patience: {self.early_stopping_patience}",
+            f"Early stopping min_delta: {self.early_stopping_min_delta}",
             f"Resume: {self.resume}",
             f"Device: {self.device}",
             "=" * 60,
@@ -207,15 +212,13 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     scheduler: CosineWarmupScheduler,
     device: str,
-    num_classes: int,
-    amp_enabled: bool = False
+    num_classes: int
 ) -> dict:
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
     num_batches = len(dataloader)
 
-    scaler = torch.cuda.amp.GradScaler() if amp_enabled else None
     epoch_start = datetime.now()
 
     for batch in dataloader:
@@ -223,20 +226,11 @@ def train_epoch(
         labels = batch[1].to(device)
         label_lengths = batch[2].to(device)
 
-        if amp_enabled:
-            with torch.cuda.amp.autocast():
-                logits = model(images)
-                loss = compute_ctc_loss(logits, labels, label_lengths, device, num_classes)
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            logits = model(images)
-            loss = compute_ctc_loss(logits, labels, label_lengths, device, num_classes)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        logits = model(images)
+        loss = compute_ctc_loss(logits, labels, label_lengths, device, num_classes)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
         total_loss += loss.item()
 
@@ -313,6 +307,37 @@ class TrainingLogger:
                     best_seq_acc = seq_acc
                     best_epoch = int(row['epoch'])
         return best_epoch, best_seq_acc
+
+
+class EarlyStopping:
+    """Early stopping handler based on sequence accuracy."""
+
+    def __init__(self, patience: int = 20, min_delta: float = 0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+        self.should_stop = False
+
+    def __call__(self, seq_acc: float) -> bool:
+        """Check if training should stop.
+
+        Returns True if training should stop.
+        """
+        if self.best_score is None:
+            self.best_score = seq_acc
+            return False
+
+        if seq_acc > self.best_score + self.min_delta:
+            self.best_score = seq_acc
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+                return True
+
+        return False
 
 
 def main():
@@ -427,8 +452,12 @@ def main():
         model.load_state_dict(state_dict)
         print("Model weights loaded")
 
-    # Initialize logger
+    # Initialize logger and early stopping
     logger = TrainingLogger(str(output_dir / "train_log.csv"))
+    early_stopping = EarlyStopping(
+        patience=cfg.early_stopping_patience,
+        min_delta=cfg.early_stopping_min_delta
+    )
 
     # Training loop
     best_seq_acc = 0.0
@@ -441,7 +470,7 @@ def main():
     for epoch in range(cfg.epochs):
         train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler,
-            device, cfg.num_classes, cfg.amp
+            device, cfg.num_classes
         )
 
         val_metrics = {'loss': 0.0, 'char_acc': 0.0, 'seq_acc': 0.0}
@@ -480,6 +509,12 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
             }, ckpt_path)
+
+        # Early stopping check
+        if val_loader and early_stopping(val_metrics['seq_acc']):
+            print(f"\nEarly stopping triggered at epoch {epoch + 1}")
+            print(f"  Best Seq Acc: {early_stopping.best_score:.4f}")
+            break
 
     # Save final model
     final_path = output_dir / "last_model.pt"

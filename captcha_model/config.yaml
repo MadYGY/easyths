@@ -40,8 +40,10 @@ Scheduler:
 Training:
   batch_size: 64
   num_workers: 4
-  amp: false
   save_interval: 20
+  early_stopping:
+    patience: 20
+    min_delta: 0.001
 
 DataAugmentation:
   enabled: true
