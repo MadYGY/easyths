@@ -1,18 +1,95 @@
 import functools
+from pathlib import Path
 
-import ddddocr
+import numpy as np
+import onnx
+import onnxruntime as ort
 import structlog
 from PIL import Image
 
 from .screen_capture import get_mss_instance
 
+logger = structlog.get_logger(f"{__file__}")
+
+class ONNXCaptchaRecognizer:
+    """ONNX-based captcha recognizer with self-contained parameters."""
+
+    def __init__(self, model_path: str, provider: str = "CPUExecutionProvider"):
+        # Load ONNX model and extract metadata
+        onnx_model = onnx.load(model_path)
+        metadata = {p.key: p.value for p in onnx_model.metadata_props}
+
+        # Read parameters from model metadata
+        self.character = metadata.get("character")
+        self.img_h = int(metadata.get("img_h"))
+        self.img_w = int(metadata.get("img_w"))
+        self.blank = len(self.character)
+
+        # Create inference session
+        providers = [self._get_provider(provider)]
+        self.session = ort.InferenceSession(model_path, providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+
+        logger.info(f"------成功加载验证码识别模型: {model_path}---------")
+        logger.info(f"图片大小: {self.img_h}x{self.img_w}")
+        logger.info(f"验证码字符集: {self.character[:20]}... ({len(self.character)} chars)")
+        logger.info(f"使用推理设备: {provider}")
+
+
+    def _get_provider(self, provider_str: str) -> str:
+        if 'cuda' in provider_str.lower() or 'gpu' in provider_str.lower():
+            return 'CUDAExecutionProvider'
+        return 'CPUExecutionProvider'
+
+    def recognize(self, image: np.ndarray | Image.Image) -> str:
+        """Run inference on image."""
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        input_tensor = self._preprocess(image)
+
+        output = self.session.run(None, {self.input_name: input_tensor})[0]
+
+        pred_indices = output.argmax(axis=1)[0].tolist()
+        text = self._ctc_decode(pred_indices)
+
+        return text
+
+    def _preprocess(self, image: np.ndarray) -> np.ndarray:
+        # 转换为 PIL Image
+        if len(image.shape) == 3:
+            # 已经是 RGB 格式，直接转换
+            img = Image.fromarray(image)
+        else:
+            # 灰度图转 RGB
+            img = Image.fromarray(image).convert('RGB')
+
+        # 缩放
+        img = img.resize((self.img_w, self.img_h), Image.Resampling.LANCZOS)
+
+        # 转换为 numpy 数组并归一化
+        img = np.array(img, dtype=np.float32) / 255.0
+        # HWC -> CHW
+        img = np.transpose(img, (2, 0, 1))
+        # 添加 batch 维度
+        img = np.expand_dims(img, axis=0)
+        return img
+
+    def _ctc_decode(self, pred_indices: list) -> str:
+        result = []
+        prev = -1
+        for idx in pred_indices:
+            if idx != prev and idx != self.blank:
+                if idx < len(self.character):
+                    result.append(self.character[idx])
+            prev = idx
+        return ''.join(result)
+
 
 @functools.lru_cache(maxsize=1)
-def _get_ocr_instance()->ddddocr.DdddOcr:
-    """获取 ddddocr 实例（全局单例）"""
-    ocr = ddddocr.DdddOcr(show_ad=False,beta=True)
-    # 小写英文 + 大写英文 + 数字
-    ocr.set_ranges("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+def _get_ocr_instance() -> ONNXCaptchaRecognizer:
+    """获取 ONNXCaptchaRecognizer 实例（全局单例）"""
+    onnx_model_path = Path(__file__).parent.parent / "assets/onnx_model" / "captcha_ocr.onnx"
+    ocr = ONNXCaptchaRecognizer(str(onnx_model_path.absolute()))
     return ocr
 
 
@@ -49,7 +126,7 @@ class CaptchaOCR:
             image = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
             # 获取 OCR 实例并识别
             ocr = _get_ocr_instance()
-            result = ocr.classification(image)
+            result = ocr.recognize(image)
             self.logger.debug(f"验证码识别结果: {result}")
             return result
 
