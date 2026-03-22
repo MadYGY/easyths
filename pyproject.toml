@@ -69,6 +69,8 @@ server = [
     "mss>=10.1.0",
     "toml>=0.10.2",
     "ddddocr==1.6.1",
+    "joblib>=1.4.0",
+    "opencv-python>=4.10.0",
     "psutil>=7.1.3",
 ]
 
