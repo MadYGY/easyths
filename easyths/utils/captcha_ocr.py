@@ -6,7 +6,7 @@ import onnx
 import onnxruntime as ort
 import structlog
 from PIL import Image
-
+from easyths.utils import project_config_instance
 from .screen_capture import get_mss_instance
 
 logger = structlog.get_logger(f"{__file__}")
@@ -89,6 +89,15 @@ class ONNXCaptchaRecognizer:
 def _get_ocr_instance() -> ONNXCaptchaRecognizer:
     """获取 ONNXCaptchaRecognizer 实例（全局单例）"""
     onnx_model_path = Path(__file__).parent.parent / "assets/onnx_model" / "captcha_ocr.onnx"
+    if project_config_instance.onnx_model_dir is not None:
+        if Path(project_config_instance.onnx_model_dir).exists():
+            onnx_model_path = Path(project_config_instance.onnx_model_dir) / "captcha_ocr.onnx"
+            onnx_model_data_path = Path(project_config_instance.onnx_model_dir) / "captcha_ocr.onnx.data"
+            if (not onnx_model_path.exists()) or (not onnx_model_data_path.exists()):
+                logger.warn(f"指定的ONNX模型目录：{project_config_instance.onnx_model_dir}中缺少captcha_ocr.onnx或captcha_ocr.onnx.data文件,将使用项目默认模型权重")
+        else:
+            logger.warn(f"指定的ONNX模型目录：{project_config_instance.onnx_model_dir}不存在,将使用项目默认模型权重")
+
     ocr = ONNXCaptchaRecognizer(str(onnx_model_path.absolute()))
     return ocr
 
