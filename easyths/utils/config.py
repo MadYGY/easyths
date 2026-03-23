@@ -7,7 +7,7 @@ class ProjectConfig:
     # App配置
     app_name = os.getenv("APP_NAME", "同花顺交易自动化程序")
     app_version = os.getenv("APP_VERSION", "1.0.0")
-    onnx_model_dir = os.getenv("APP_ONNX_MODEL_DIR", "")
+    onnx_model_dir = os.getenv("APP_ONNX_MODEL_DIR", None)
 
     # Trading配置
     trading_app_path = os.getenv("TRADING_APP_PATH", "C:/同花顺远航版/transaction/xiadan.exe")
@@ -51,7 +51,8 @@ class ProjectConfig:
             if "version" in app_config:
                 self.app_version = app_config["version"]
             if "onnx_model_dir" in app_config:
-                self.onnx_model_dir = app_config["onnx_model_dir"]
+                # 空字符串转换为 None
+                self.onnx_model_dir = app_config["onnx_model_dir"] or None
 
         # 处理 [trading] 部分
         if "trading" in config:
