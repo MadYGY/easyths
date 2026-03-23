@@ -399,6 +399,7 @@ class BaseOperation(ABC):
         """
         处理验证码弹窗
         """
+        captcha_code_length = 0
         count = 0
         while self.is_exist_pop_dialog() and count < 5:
             pop_dialog_title, pop_control = self.get_pop_dialog()
@@ -406,13 +407,14 @@ class BaseOperation(ABC):
                 code_edit = self.get_control_with_children(pop_control, control_type="Edit", auto_id="2404",
                                                            class_name="Edit")
                 # 尝试删除可能存在的旧验证码
-                code_edit.type_keys('{BACKSPACE 4}')
+                code_edit.type_keys('{{BACKSPACE {}}}'.format(captcha_code_length))
                 code_image_control = self.get_control_with_children(pop_control, control_type="Image", auto_id="2405",
                                                                     class_name="Static")
                 code_image_control.click_input()
                 # 等待刷新验证码
                 self.sleep(0.2)
                 captcha_code = self.ocr_captcha(code_image_control)
+                captcha_code_length = len(captcha_code)
                 code_edit.type_keys(captcha_code)
                 self.sleep(0.1)
                 # 按确定键
@@ -458,9 +460,6 @@ class BaseOperation(ABC):
     def ocr_captcha(self, control: Any) -> str:
         """根据控件获取OCR验证码结果"""
         code = get_captcha_ocr_server().recognize(control)
-        #同花顺验证码一般是4位，防止出现大于4位的code，这个概率几乎没有
-        if len(code) > 4:
-            code = code[:4]
         return code
 
 
