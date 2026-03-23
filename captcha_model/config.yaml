@@ -1,41 +1,31 @@
 Global:
   use_gpu: true
-  # Character set: digits + uppercase + lowercase letters
+  # Character set (auto-sorted at runtime for consistent index mapping)
   character: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-  # Image size
   img_h: 64
   img_w: 256
-  # Random seed
   seed: 42
-  # Output directory
   output_dir: "outputs"
-  # Resume from best model if exists
   resume: true
 
 Architecture:
-  name: ResNetOCR
   backbone:
-    name: ResNet34
-    pretrained: true
-    freeze_backbone: false
-  encoder:
-    seq_len: 32
+    nc: 1  # 1=grayscale, 3=RGB
   head:
     hidden_dim: 128
-    dropout: 0.3
-
-Loss:
-  name: CTCLoss
 
 Optimizer:
-  name: AdamW
   lr: 0.0001
   weight_decay: 0.00001
 
 Scheduler:
-  name: CosineWarmup
-  warmup_epoch: 5
-  epochs: 200
+  type: onecycle  # onecycle or cosine
+  epochs: 150
+  # OneCycleLR params
+  max_lr: 0.003
+  div_factor: 25        # initial_lr = max_lr / div_factor = 1.2e-4
+  final_div_factor: 1000 # final_lr = max_lr / (div_factor * final_div_factor) = 1.2e-7
+  pct_start: 0.3         # 30% warmup, 70% decay
 
 Training:
   batch_size: 64

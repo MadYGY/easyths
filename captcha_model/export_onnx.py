@@ -1,13 +1,11 @@
 """
-Export Captcha Recognition Model to ONNX Format.
+Export Captcha Recognition Model to ONNX.
 
-All necessary parameters (character set, image size) are embedded into the ONNX
-model metadata, so inference only requires the ONNX file without external config.
+Inference parameters (character, img_h, img_w, nc) are embedded into ONNX metadata.
 
 Usage:
-    python export_onnx.py                    # Export with default config
-    python export_onnx.py --model path/to/model.pt  # Export specific model
-    python export_onnx.py --output onnx_model  # Custom output directory
+    python export_onnx.py
+    python export_onnx.py --model outputs/best_model.pt --output onnx_model
 
 Author: noimank (康康)
 Email: noimank@163.com
@@ -17,6 +15,7 @@ import sys
 import warnings
 import logging
 from pathlib import Path
+
 import numpy as np
 
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
@@ -29,155 +28,80 @@ import torch
 import onnx
 import onnxruntime as ort
 
-from models.resnet_ocr import ResNetOCR
+from models.crnn import CRNN, DEFAULT_CHARSET
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Export Captcha Model to ONNX")
-
-    parser.add_argument("--config", type=str, default="config.yaml",
-                        help="Config file path")
-    parser.add_argument("--model", type=str, default="outputs/best_model.pt",
-                        help="Model path (.pt)")
-    parser.add_argument("--output", type=str, default="onnx_model",
-                        help="Output directory")
-    parser.add_argument("--name", type=str, default="captcha_ocr.onnx",
-                        help="Output ONNX file name")
-    parser.add_argument("--opset", type=int, default=18,
-                        help="ONNX opset version (18 recommended, use 17+ for best compatibility)")
-
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Export Captcha Model to ONNX")
+    p.add_argument("--config", type=str, default="config.yaml")
+    p.add_argument("--model", type=str, default="outputs/best_model.pt")
+    p.add_argument("--output", type=str, default="onnx_model")
+    p.add_argument("--name", type=str, default="captcha_ocr.onnx")
+    p.add_argument("--opset", type=int, default=18)
+    return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # Load config
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
-    global_cfg = config.get('Global', {})
+    g = config.get('Global', {})
+    a = config.get('Architecture', {})
+    character = g.get('character', DEFAULT_CHARSET)
+    img_h, img_w = g.get('img_h', 64), g.get('img_w', 256)
+    nc = a.get('backbone', {}).get('nc', 1)
+    hidden_size = a.get('head', {}).get('hidden_dim', 128)
 
-    character = global_cfg.get('character', "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
-    img_h = global_cfg.get('img_h', 64)
-    img_w = global_cfg.get('img_w', 256)
-    num_classes = len(character) + 1
+    model = CRNN(character=character, img_h=img_h, img_w=img_w,
+                 nc=nc, hidden_size=hidden_size)
 
-    print("\n" + "=" * 60)
-    print("Exporting Captcha Recognition Model to ONNX")
-    print("=" * 60)
-    print(f"Config: {args.config}")
-    print(f"Model: {args.model}")
-    print(f"Image size: {img_h}x{img_w}")
-    print(f"Character set: {character[:20]}... ({len(character)} chars)")
-    print(f"Num classes: {num_classes}")
-    print(f"Opset: {args.opset}")
-    print("=" * 60)
+    print(f"\nExport ONNX | {img_h}x{img_w} nc={nc} | charset={len(model.character)} "
+          f"| classes={model.num_classes} | opset={args.opset}")
 
-    # Check model path
     model_path = Path(args.model)
     if not model_path.exists():
-        print(f"Model not found: {model_path}")
-        sys.exit(1)
+        print(f"Model not found: {model_path}"); sys.exit(1)
 
-    # Build model
-    device = torch.device("cpu")
-    model = ResNetOCR(
-        img_h=img_h,
-        img_w=img_w,
-        num_classes=num_classes,
-        character=character,
-        pretrained=False,
-        freeze_backbone=True
-    ).to(device)
-
-    # Load weights
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    else:
-        state_dict = checkpoint
-    model.load_state_dict(state_dict)
+    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+    state = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+    model.load_state_dict(state)
     model.eval()
 
-    print("Model loaded successfully")
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / args.name
 
-    # Create output directory
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / args.name
+    dummy = torch.randn(1, nc, img_h, img_w)
 
-    # Export to ONNX
-    try:
-        dummy_input = torch.randn(1, 3, img_h, img_w)
+    torch.onnx.export(
+        model, dummy, str(out_path),
+        input_names=["input"], output_names=["output"],
+        opset_version=args.opset, dynamic_axes=None,
+        training=torch.onnx.TrainingMode.EVAL,
+    )
 
-        # Export with specified opset version
-        # Note: onnxscript may attempt version conversion for lower opsets
-        # Use opset 17+ for best compatibility with modern PyTorch operations
-        torch.onnx.export(
-            model,
-            dummy_input,
-            str(output_path),
-            input_names=["input"],
-            output_names=["output"],
-            opset_version=args.opset,
-            dynamic_axes=None,
-            training=torch.onnx.TrainingMode.EVAL
-        )
+    # Embed metadata
+    onnx_model = onnx.load(str(out_path))
+    for k, v in [("character", model.character), ("img_h", str(img_h)),
+                 ("img_w", str(img_w)), ("nc", str(nc))]:
+        m = onnx_model.metadata_props.add()
+        m.key, m.value = k, v
+    onnx.save(onnx_model, str(out_path))
 
-        # Add metadata to ONNX model
-        onnx_model = onnx.load(str(output_path))
+    # Verify
+    sess = ort.InferenceSession(str(out_path))
+    inp = sess.get_inputs()[0]
+    ort_out = sess.run(None, {inp.name: dummy.numpy()})[0]
 
-        # Embed inference parameters into model metadata
-        meta = onnx_model.metadata_props.add()
-        meta.key = "character"
-        meta.value = character
+    with torch.no_grad():
+        pt_out = model(dummy).numpy()
 
-        meta = onnx_model.metadata_props.add()
-        meta.key = "img_h"
-        meta.value = str(img_h)
-
-        meta = onnx_model.metadata_props.add()
-        meta.key = "img_w"
-        meta.value = str(img_w)
-
-        onnx.save(onnx_model, str(output_path))
-        print(f"  Metadata embedded: character({len(character)} chars), img_h={img_h}, img_w={img_w}")
-
-        # Verify
-        session = ort.InferenceSession(str(output_path))
-        input_info = session.get_inputs()[0]
-        output_info = session.get_outputs()[0]
-
-        print(f"\nONNX model exported: {output_path}")
-        print(f"  Input: {input_info.name} {input_info.shape}")
-        print(f"  Output: {output_info.name} {output_info.shape}")
-
-        # Test inference
-        ort_inputs = {input_info.name: dummy_input.numpy()}
-        ort_output = session.run(None, ort_inputs)[0]
-        print(f"  Output shape: {ort_output.shape}")
-
-        # Verify output matches
-        with torch.no_grad():
-            torch_output = model(dummy_input).numpy()
-
-        if np.allclose(torch_output, ort_output, rtol=1e-4, atol=1e-4):
-            print("  Verification: PASSED (PyTorch and ONNX outputs match)")
-        else:
-            print("  Verification: WARNING (outputs differ slightly)")
-
-        print("\n" + "=" * 60)
-        print("Export completed successfully!")
-        print("=" * 60)
-
-        return str(output_path)
-
-    except Exception as e:
-        print(f"Export failed: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    match = np.allclose(pt_out, ort_out, rtol=1e-4, atol=1e-4)
+    print(f"Input: {inp.shape}  Output: {list(ort_out.shape)}")
+    print(f"Verify: {'PASS' if match else 'WARN (slight diff)'}")
+    print(f"Saved: {out_path}")
 
 
 if __name__ == "__main__":

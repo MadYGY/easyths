@@ -3,7 +3,7 @@ Captcha Recognition Training Script.
 
 Usage:
     python train.py                          # Use default config
-    python train.py --config custom.yaml    # Use custom config
+    python train.py --config custom.yaml     # Use custom config
 
 Author: noimank (康康)
 Email: noimank@163.com
@@ -16,519 +16,322 @@ from pathlib import Path
 from datetime import datetime
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 import yaml
 
-from models.resnet_ocr import ResNetOCR, CosineWarmupScheduler
+from models.crnn import CRNN, DEFAULT_CHARSET
 from models.loss import CaptchaDataset
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Captcha Recognition Training")
-    parser.add_argument(
-        "--config", type=str, default="config.yaml",
-        help="Config YAML file path"
-    )
+    parser.add_argument("--config", type=str, default="config.yaml", help="Config YAML file path")
     return parser.parse_args()
 
 
-def load_config(config_path: str) -> dict:
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    return config
-
-
 class TrainConfig:
-    """Training configuration from YAML file."""
+    """Training configuration from YAML."""
 
     def __init__(self, config: dict):
-        self._config = config
-        self._parse_config()
+        g = config.get('Global', {})
+        a = config.get('Architecture', {})
+        o = config.get('Optimizer', {})
+        s = config.get('Scheduler', {})
+        t = config.get('Training', {})
+        d = config.get('Dataset', {})
+        es = t.get('early_stopping', {})
 
-    def _parse_config(self):
-        global_cfg = self._config.get('Global', {})
-        arch_cfg = self._config.get('Architecture', {})
-        backbone_cfg = arch_cfg.get('backbone', {})
-        head_cfg = arch_cfg.get('head', {})
-        opt_cfg = self._config.get('Optimizer', {})
-        scheduler_cfg = self._config.get('Scheduler', {})
-        train_cfg = self._config.get('Training', {})
-        dataset_cfg = self._config.get('Dataset', {})
+        self.use_gpu = g.get('use_gpu', True)
+        self.character = g.get('character', DEFAULT_CHARSET)
+        self.img_h = g.get('img_h', 64)
+        self.img_w = g.get('img_w', 256)
+        self.seed = g.get('seed', 42)
+        self.output_dir = g.get('output_dir', 'outputs')
+        self.resume = g.get('resume', True)
 
-        # Global settings
-        self.use_gpu = global_cfg.get('use_gpu', True)
-        self.character = global_cfg.get('character', "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
-        self.img_h = global_cfg.get('img_h', 64)
-        self.img_w = global_cfg.get('img_w', 256)
-        self.seed = global_cfg.get('seed', 42)
-        self.output_dir = global_cfg.get('output_dir', "data/outputs/captcha_ocr")
-        self.resume = global_cfg.get('resume', True)
+        self.nc = a.get('backbone', {}).get('nc', 1)
+        self.hidden_size = a.get('head', {}).get('hidden_dim', 128)
 
-        # Architecture settings
-        self.pretrained = backbone_cfg.get('pretrained', True)
-        self.freeze_backbone = backbone_cfg.get('freeze_backbone', True)
-        self.hidden_dim = head_cfg.get('hidden_dim', 128)
-        self.dropout = head_cfg.get('dropout', 0.3)
+        self.lr = o.get('lr', 1e-4)
+        self.weight_decay = o.get('weight_decay', 1e-5)
+        self.epochs = s.get('epochs', 150)
+        self.scheduler_type = s.get('type', 'onecycle')
+        self.max_lr = s.get('max_lr', 3e-3)
+        self.div_factor = s.get('div_factor', 25)
+        self.final_div_factor = s.get('final_div_factor', 1000)
+        self.pct_start = s.get('pct_start', 0.3)
 
-        # Optimizer settings
-        self.lr = opt_cfg.get('lr', 1e-4)
-        self.weight_decay = opt_cfg.get('weight_decay', 1e-5)
+        self.batch_size = t.get('batch_size', 32)
+        self.num_workers = t.get('num_workers', 0)
+        self.save_interval = t.get('save_interval', 20)
+        self.es_patience = es.get('patience', 20)
+        self.es_min_delta = es.get('min_delta', 0.001)
 
-        # Scheduler settings
-        self.warmup_epochs = scheduler_cfg.get('warmup_epoch', 5)
-        self.epochs = scheduler_cfg.get('epochs', 200)
+        self.train_dir = d.get('train_dir', 'data/train')
+        self.val_dir = d.get('val_dir', 'data/val')
 
-        # Training settings
-        self.batch_size = train_cfg.get('batch_size', 32)
-        self.num_workers = train_cfg.get('num_workers', 0)
-        self.save_interval = train_cfg.get('save_interval', 20)
+        self.device = 'cuda' if self.use_gpu and torch.cuda.is_available() else 'cpu'
 
-        # Early stopping settings
-        early_stopping_cfg = train_cfg.get('early_stopping', {})
-        self.early_stopping_patience = early_stopping_cfg.get('patience', 20)
-        self.early_stopping_min_delta = early_stopping_cfg.get('min_delta', 0.001)
-
-        # Dataset settings
-        self.train_dir = dataset_cfg.get('train_dir', 'data/train')
-        self.val_dir = dataset_cfg.get('val_dir', 'data/val')
-
-        # Derived values
-        self.num_classes = len(self.character) + 1  # +1 for blank
-        self.device = "cuda" if self.use_gpu and torch.cuda.is_available() else "cpu"
-
-    def __repr__(self) -> str:
+    def print_summary(self, model: CRNN):
         lines = [
             "=" * 60,
-            "Captcha Recognition Training",
+            "Captcha Recognition Training (CRNN)",
             "=" * 60,
-            f"Image size: {self.img_h}x{self.img_w}",
-            f"Character set: {self.character[:20]}... ({len(self.character)} chars)",
-            f"Num classes: {self.num_classes}",
-            f"Epochs: {self.epochs}",
-            f"Batch size: {self.batch_size}",
-            f"Learning rate: {self.lr}",
-            f"Warmup epochs: {self.warmup_epochs}",
-            f"Output: {self.output_dir}",
-            "-" * 60,
-            f"Train dir: {self.train_dir}",
-            f"Val dir: {self.val_dir}",
-            "-" * 60,
-            f"Early stopping patience: {self.early_stopping_patience}",
-            f"Early stopping min_delta: {self.early_stopping_min_delta}",
-            f"Resume: {self.resume}",
-            f"Device: {self.device}",
+            f"Image: {self.img_h}x{self.img_w} (nc={self.nc})",
+            f"Charset: {model.character[:20]}... ({len(model.character)} chars, sorted)",
+            f"Classes: {model.num_classes} (auto: charset + blank)",
+            f"Hidden: {self.hidden_size}  SeqLen: {model.get_seq_len()}",
+            f"Epochs: {self.epochs}  BS: {self.batch_size}  MaxLR: {self.max_lr}",
+            f"Train: {self.train_dir}  Val: {self.val_dir}",
+            f"Device: {self.device}  Resume: {self.resume}",
             "=" * 60,
         ]
-        return "\n".join(lines)
+        print("\n".join(lines))
 
+
+# ── Helpers ──────────────────────────────────────────────────
 
 def collate_fn(batch):
-    """Custom collate function for variable length labels."""
-    images = torch.stack([item[0] for item in batch], dim=0)
-    max_label_len = max(item[1].shape[0] for item in batch)
-    labels = torch.zeros(len(batch), max_label_len, dtype=torch.long)
-    label_lengths = torch.zeros(len(batch), dtype=torch.long)
-
-    for i, (img, label, length) in enumerate(batch):
-        labels[i, :length] = label
-        label_lengths[i] = length
-
-    return images, labels, label_lengths
+    images = torch.stack([b[0] for b in batch])
+    max_len = max(b[1].shape[0] for b in batch)
+    labels = torch.zeros(len(batch), max_len, dtype=torch.long)
+    lengths = torch.zeros(len(batch), dtype=torch.long)
+    for i, (_, lbl, ln) in enumerate(batch):
+        labels[i, :ln] = lbl
+        lengths[i] = ln
+    return images, labels, lengths
 
 
-def compute_ctc_loss(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    label_lengths: torch.Tensor,
-    device: str,
-    num_classes: int
-) -> torch.Tensor:
-    """Compute CTC loss."""
+def compute_ctc_loss(logits, labels, label_lengths, device, num_classes):
     B, C, T = logits.shape
     input_lengths = torch.full((B,), T, dtype=torch.long, device=device)
-
-    log_probs = logits.permute(2, 0, 1)  # (T, B, C)
-    log_probs = F.log_softmax(log_probs, dim=2)
-
-    blank_idx = num_classes - 1
-
-    loss = F.ctc_loss(
-        log_probs,
-        labels,
-        input_lengths.cpu().tolist(),
-        label_lengths.cpu().tolist(),
-        blank=blank_idx,
-        reduction='mean',
-        zero_infinity=True
+    log_probs = F.log_softmax(logits.permute(2, 0, 1), dim=2)   # (T, B, C)
+    return F.ctc_loss(
+        log_probs, labels,
+        input_lengths.cpu().tolist(), label_lengths.cpu().tolist(),
+        blank=num_classes - 1, reduction='mean', zero_infinity=True
     )
 
-    return loss
 
-
-def ctc_greedy_decode(logits: torch.Tensor, blank: int) -> list:
-    """Greedy decode CTC predictions."""
-    predictions = logits.argmax(dim=1).cpu().numpy()
+def ctc_greedy_decode(logits, blank):
+    preds = logits.argmax(dim=1).cpu().numpy()
     results = []
-
-    for pred in predictions:
-        result = []
-        prev = -1
+    for pred in preds:
+        out, prev = [], -1
         for idx in pred:
-            idx_int = int(idx)
-            if idx_int != prev and idx_int != blank:
-                result.append(idx_int)
-            prev = idx_int
-        results.append(result)
-
+            idx = int(idx)
+            if idx != prev and idx != blank:
+                out.append(idx)
+            prev = idx
+        results.append(out)
     return results
 
 
-def compute_accuracy(pred_seqs: list, label_seqs: list) -> tuple:
-    """Compute character and sequence accuracy."""
-    total_chars = 0
-    correct_chars = 0
-    correct_seqs = 0
-
+def compute_accuracy(pred_seqs, label_seqs):
+    total_chars = correct_chars = correct_seqs = 0
     for pred, label in zip(pred_seqs, label_seqs):
         total_chars += len(label)
-        for p, l in zip(pred, label):
-            if p == l:
-                correct_chars += 1
+        correct_chars += sum(p == l for p, l in zip(pred, label))
         if pred == label:
             correct_seqs += 1
-
     char_acc = correct_chars / max(total_chars, 1)
-    seq_acc = correct_seqs / len(pred_seqs) if pred_seqs else 0
-
+    seq_acc = correct_seqs / max(len(pred_seqs), 1)
     return char_acc, seq_acc
 
 
-def train_epoch(
-    model: nn.Module,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scheduler: CosineWarmupScheduler,
-    device: str,
-    num_classes: int
-) -> dict:
-    """Train for one epoch."""
+# ── Train / Eval ─────────────────────────────────────────────
+
+def train_epoch(model, loader, optimizer, scheduler, device, num_classes):
     model.train()
-    total_loss = 0.0
-    num_batches = len(dataloader)
-
-    epoch_start = datetime.now()
-
-    for batch in dataloader:
-        images = batch[0].to(device)
-        labels = batch[1].to(device)
-        label_lengths = batch[2].to(device)
-
-        logits = model(images)
-        loss = compute_ctc_loss(logits, labels, label_lengths, device, num_classes)
+    total_loss, n = 0.0, len(loader)
+    t0 = datetime.now()
+    for imgs, labels, lengths in loader:
+        imgs = imgs.to(device)
+        logits = model(imgs)
+        loss = compute_ctc_loss(logits, labels, lengths, device, num_classes)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
+        scheduler.step()
         total_loss += loss.item()
-
-    scheduler.step()
-    epoch_time = (datetime.now() - epoch_start).total_seconds()
-
-    return {'loss': total_loss / num_batches, 'time': epoch_time}
+    return {'loss': total_loss / n, 'time': (datetime.now() - t0).total_seconds()}
 
 
-def evaluate(
-    model: nn.Module,
-    dataloader: DataLoader,
-    device: str,
-    num_classes: int
-) -> dict:
-    """Evaluate model."""
+def evaluate(model, loader, device, num_classes):
     model.eval()
-    total_loss = 0.0
-    all_preds = []
-    all_labels = []
-    num_batches = len(dataloader)
-    blank_idx = num_classes - 1
-
+    total_loss, all_preds, all_labels = 0.0, [], []
+    blank = num_classes - 1
     with torch.no_grad():
-        for batch in dataloader:
-            images = batch[0].to(device)
-            labels = batch[1].to(device)
-            label_lengths = batch[2].to(device)
-
-            logits = model(images)
-            loss = compute_ctc_loss(logits, labels, label_lengths, device, num_classes)
-            total_loss += loss.item()
-
-            preds = ctc_greedy_decode(logits, blank_idx)
-            all_preds.extend(preds)
-
-            for i, length in enumerate(label_lengths):
-                label_list = labels[i, :length].cpu().tolist()
-                all_labels.append(label_list)
-
+        for imgs, labels, lengths in loader:
+            imgs = imgs.to(device)
+            logits = model(imgs)
+            total_loss += compute_ctc_loss(logits, labels, lengths, device, num_classes).item()
+            all_preds.extend(ctc_greedy_decode(logits, blank))
+            for i, ln in enumerate(lengths):
+                all_labels.append(labels[i, :ln].cpu().tolist())
     char_acc, seq_acc = compute_accuracy(all_preds, all_labels)
+    return {'loss': total_loss / len(loader), 'char_acc': char_acc, 'seq_acc': seq_acc}
 
-    return {
-        'loss': total_loss / num_batches,
-        'char_acc': char_acc,
-        'seq_acc': seq_acc
-    }
 
+# ── Logger / EarlyStopping ───────────────────────────────────
 
 class TrainingLogger:
-    """CSV-based training logger."""
+    HEADERS = ['epoch', 'train_loss', 'val_loss', 'char_acc', 'seq_acc', 'lr', 'time']
 
-    def __init__(self, log_file: str):
-        self.log_file = log_file
-        self.headers = ['epoch', 'train_loss', 'val_loss', 'char_acc', 'seq_acc', 'lr', 'time']
-        with open(log_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(self.headers)
+    def __init__(self, path):
+        self.path = path
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(self.HEADERS)
 
-    def log(self, epoch: int, train_loss: float, val_loss: float,
-            char_acc: float, seq_acc: float, lr: float, time: float):
-        with open(self.log_file, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([epoch, train_loss, val_loss, char_acc, seq_acc, lr, time])
+    def log(self, **kw):
+        with open(self.path, 'a', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow([kw.get(h, '') for h in self.HEADERS])
 
-    def get_best_epoch(self) -> tuple:
-        best_seq_acc = 0.0
-        best_epoch = 0
-        with open(self.log_file, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                seq_acc = float(row['seq_acc']) if row['seq_acc'] else 0.0
-                if seq_acc > best_seq_acc:
-                    best_seq_acc = seq_acc
-                    best_epoch = int(row['epoch'])
-        return best_epoch, best_seq_acc
+    def get_best_epoch(self):
+        best_acc, best_ep = 0.0, 0
+        with open(self.path, 'r', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                acc = float(row['seq_acc'] or 0)
+                if acc > best_acc:
+                    best_acc, best_ep = acc, int(row['epoch'])
+        return best_ep, best_acc
 
 
 class EarlyStopping:
-    """Early stopping handler based on sequence accuracy."""
+    def __init__(self, patience=20, min_delta=0.001):
+        self.patience, self.min_delta = patience, min_delta
+        self.counter, self.best = 0, None
 
-    def __init__(self, patience: int = 20, min_delta: float = 0.001):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_score = None
-        self.should_stop = False
-
-    def __call__(self, seq_acc: float) -> bool:
-        """Check if training should stop.
-
-        Returns True if training should stop.
-        """
-        if self.best_score is None:
-            self.best_score = seq_acc
+    def __call__(self, score):
+        if self.best is None or score > self.best + self.min_delta:
+            self.best, self.counter = score, 0
             return False
+        self.counter += 1
+        return self.counter >= self.patience
 
-        if seq_acc > self.best_score + self.min_delta:
-            self.best_score = seq_acc
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.should_stop = True
-                return True
 
-        return False
-
+# ── Main ─────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
-
     config_path = Path(args.config)
     if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+        print(f"Config not found: {config_path}")
+        sys.exit(1)
 
-    config = load_config(str(config_path))
-    cfg = TrainConfig(config)
+    with open(config_path, 'r', encoding='utf-8') as f:
+        raw_config = yaml.safe_load(f)
+    cfg = TrainConfig(raw_config)
 
-    device = torch.device(cfg.device)
-    print(f"\nUsing device: {device}")
-    print(cfg)
-
-    # Set seeds
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
+    device = torch.device(cfg.device)
 
-    # Build model
-    model = ResNetOCR(
-        img_h=cfg.img_h,
-        img_w=cfg.img_w,
-        num_classes=cfg.num_classes,
+    # Build model (num_classes derived from character automatically)
+    model = CRNN(
         character=cfg.character,
-        pretrained=cfg.pretrained,
-        freeze_backbone=cfg.freeze_backbone,
-        hidden_dim=cfg.hidden_dim,
-        dropout=cfg.dropout
+        img_h=cfg.img_h, img_w=cfg.img_w,
+        nc=cfg.nc, hidden_size=cfg.hidden_size,
     ).to(device)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {total_params:,} (trainable: {trainable_params:,})")
+    cfg.print_summary(model)
 
-    # Build optimizer
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay
-    )
+    total_p = sum(p.numel() for p in model.parameters())
+    train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Parameters: {total_p:,} (trainable: {train_p:,})")
 
-    # Build scheduler
-    scheduler = CosineWarmupScheduler(
-        optimizer,
-        warmup_epochs=cfg.warmup_epochs,
-        total_epochs=cfg.epochs,
-        min_lr=1e-6
-    )
-
-    # Build datasets
-    augmentation_config = config.get('DataAugmentation', {})
-
-    train_dataset = CaptchaDataset(
-        data_dir=cfg.train_dir,
-        img_h=cfg.img_h,
-        img_w=cfg.img_w,
-        character=cfg.character,
-        augment=True,
-        augmentation_config=augmentation_config
-    )
-
-    val_dataset = None
+    # Datasets (character sorted inside Dataset, same as model)
+    aug_cfg = raw_config.get('DataAugmentation', {})
+    train_ds = CaptchaDataset(cfg.train_dir, character=cfg.character,
+                              img_h=cfg.img_h, img_w=cfg.img_w, nc=cfg.nc,
+                              augment=True, augmentation_config=aug_cfg)
+    val_ds = None
     if cfg.val_dir and os.path.exists(cfg.val_dir):
-        val_dataset = CaptchaDataset(
-            data_dir=cfg.val_dir,
-            img_h=cfg.img_h,
-            img_w=cfg.img_w,
-            character=cfg.character,
-            augment=False
-        )
-        val_dataset.training = False
+        val_ds = CaptchaDataset(cfg.val_dir, character=cfg.character,
+                                img_h=cfg.img_h, img_w=cfg.img_w, nc=cfg.nc, augment=False)
+        val_ds.training = False
 
-    print(f"Train samples: {len(train_dataset)}")
-    if val_dataset:
-        print(f"Val samples: {len(val_dataset)}")
+    print(f"Train: {len(train_ds)}  Val: {len(val_ds) if val_ds else 0}")
 
-    # Build dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=True,
-        collate_fn=collate_fn
+    if len(train_ds) == 0:
+        print(f"Error: No training data in {cfg.train_dir}")
+        sys.exit(1)
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
+                              num_workers=cfg.num_workers, pin_memory=torch.cuda.is_available(),
+                              drop_last=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
+                            num_workers=cfg.num_workers, pin_memory=torch.cuda.is_available(),
+                            collate_fn=collate_fn) if val_ds else None
+
+    # Optimizer / Scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    steps_per_epoch = len(train_loader)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=cfg.max_lr,
+        epochs=cfg.epochs,
+        steps_per_epoch=steps_per_epoch,
+        div_factor=cfg.div_factor,
+        final_div_factor=cfg.final_div_factor,
+        pct_start=cfg.pct_start,
+        anneal_strategy='cos',
     )
 
-    val_loader = None
-    if val_dataset:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=cfg.num_workers,
-            pin_memory=torch.cuda.is_available(),
-            collate_fn=collate_fn
-        )
+    # Resume
+    out_dir = Path(cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    best_path = out_dir / "best_model.pt"
+    if cfg.resume and best_path.exists():
+        model.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
+        print(f"Resumed from {best_path}")
 
-    # Create output directory
-    output_dir = Path(cfg.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    logger = TrainingLogger(str(out_dir / "train_log.csv"))
+    es = EarlyStopping(cfg.es_patience, cfg.es_min_delta)
 
-    # Resume from best model
-    best_model_path = output_dir / "best_model.pt"
-    if cfg.resume and best_model_path.exists():
-        print(f"Resuming from: {best_model_path}")
-        state_dict = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(state_dict)
-        print("Model weights loaded")
+    # Training
+    best_acc = 0.0
+    t_start = datetime.now()
+    nc = model.num_classes
 
-    # Initialize logger and early stopping
-    logger = TrainingLogger(str(output_dir / "train_log.csv"))
-    early_stopping = EarlyStopping(
-        patience=cfg.early_stopping_patience,
-        min_delta=cfg.early_stopping_min_delta
-    )
-
-    # Training loop
-    best_seq_acc = 0.0
-    start_time = datetime.now()
-
-    print("\n" + "-" * 80)
-    print(f"{'Epoch':>5} | {'Train Loss':>12} | {'Val Loss':>12} | {'Char Acc':>10} | {'Seq Acc':>10} | {'LR':>10} | {'Time':>8}")
-    print("-" * 80)
+    hdr = f"{'Ep':>4} | {'TrLoss':>10} | {'VaLoss':>10} | {'ChAcc':>8} | {'SqAcc':>8} | {'LR':>10} | {'Time':>6}"
+    print("\n" + "-" * len(hdr))
+    print(hdr)
+    print("-" * len(hdr))
 
     for epoch in range(cfg.epochs):
-        train_metrics = train_epoch(
-            model, train_loader, optimizer, scheduler,
-            device, cfg.num_classes
-        )
+        tr = train_epoch(model, train_loader, optimizer, scheduler, device, nc)
+        va = evaluate(model, val_loader, device, nc) if val_loader else {'loss': 0, 'char_acc': 0, 'seq_acc': 0}
+        lr = scheduler.get_last_lr()[0]
 
-        val_metrics = {'loss': 0.0, 'char_acc': 0.0, 'seq_acc': 0.0}
-        if val_loader:
-            val_metrics = evaluate(model, val_loader, device, cfg.num_classes)
+        print(f"{epoch+1:>4} | {tr['loss']:>10.4f} | {va['loss']:>10.4f} | "
+              f"{va['char_acc']:>8.4f} | {va['seq_acc']:>8.4f} | {lr:>10.6f} | {tr['time']:>5.1f}s")
 
-        current_lr = scheduler.get_last_lr()[0]
-        epoch_time = train_metrics['time']
+        logger.log(epoch=epoch+1, train_loss=tr['loss'], val_loss=va['loss'],
+                   char_acc=va['char_acc'], seq_acc=va['seq_acc'], lr=lr, time=tr['time'])
 
-        print(f"{epoch + 1:>5} | {train_metrics['loss']:>12.4f} | "
-              f"{val_metrics['loss']:>12.4f} | {val_metrics['char_acc']:>10.4f} | "
-              f"{val_metrics['seq_acc']:>10.4f} | {current_lr:>10.6f} | {epoch_time:>7.1f}s")
+        if val_loader and va['seq_acc'] > best_acc:
+            best_acc = va['seq_acc']
+            torch.save(model.state_dict(), best_path)
+            print(f"  -> best (SeqAcc={best_acc:.4f})")
 
-        logger.log(
-            epoch + 1,
-            train_metrics['loss'],
-            val_metrics['loss'],
-            val_metrics['char_acc'],
-            val_metrics['seq_acc'],
-            current_lr,
-            epoch_time
-        )
-
-        # Save best model
-        if val_loader and val_metrics['seq_acc'] > best_seq_acc:
-            best_seq_acc = val_metrics['seq_acc']
-            torch.save(model.state_dict(), best_model_path)
-            print(f"  [*] New best model (Seq Acc: {best_seq_acc:.4f})")
-
-        # Save checkpoint
         if (epoch + 1) % cfg.save_interval == 0:
-            ckpt_path = output_dir / f"epoch_{epoch + 1}.pt"
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-            }, ckpt_path)
+            torch.save({'epoch': epoch+1, 'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict()}, out_dir / f"epoch_{epoch+1}.pt")
 
-        # Early stopping check
-        if val_loader and early_stopping(val_metrics['seq_acc']):
-            print(f"\nEarly stopping triggered at epoch {epoch + 1}")
-            print(f"  Best Seq Acc: {early_stopping.best_score:.4f}")
+        if val_loader and es(va['seq_acc']):
+            print(f"\nEarly stopping at epoch {epoch+1}, best={es.best:.4f}")
             break
 
-    # Save final model
-    final_path = output_dir / "last_model.pt"
-    torch.save(model.state_dict(), final_path)
-
-    total_time = (datetime.now() - start_time).total_seconds()
-    best_epoch, best_seq_acc_value = logger.get_best_epoch()
-
-    print("-" * 80)
-    print(f"\nTraining completed!")
-    print(f"  Total time: {total_time / 60:.1f} minutes")
-    print(f"  Best epoch: {best_epoch} (Seq Acc: {best_seq_acc_value:.4f})")
-    print(f"  Final model: {final_path}")
-    print(f"  Best model: {best_model_path}")
+    torch.save(model.state_dict(), out_dir / "last_model.pt")
+    total_time = (datetime.now() - t_start).total_seconds()
+    best_ep, best_val = logger.get_best_epoch()
+    print(f"\nDone in {total_time/60:.1f}min | Best ep={best_ep} SeqAcc={best_val:.4f}")
 
 
 if __name__ == "__main__":

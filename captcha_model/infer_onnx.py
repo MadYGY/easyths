@@ -1,15 +1,12 @@
 """
 ONNX Inference Script for Captcha Recognition.
 
-All inference parameters (character set, image size) are read from ONNX model
-metadata, so no external config file is needed.
+All parameters are read from ONNX metadata — no config needed.
 
 Usage:
-    python infer_onnx.py                           # Run on test images
-    python infer_onnx.py --model model.onnx        # Use specific model
-    python infer_onnx.py --image captcha.png       # Test single image
-    python infer_onnx.py --dir data/test           # Test directory
-    python infer_onnx.py --benchmark               # Run benchmark
+    python infer_onnx.py --model model.onnx --image captcha.png
+    python infer_onnx.py --model model.onnx --dir data/test
+    python infer_onnx.py --model model.onnx --benchmark
 
 Author: noimank (康康)
 Email: noimank@163.com
@@ -18,7 +15,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Tuple
 
 import cv2
 import numpy as np
@@ -27,217 +24,121 @@ import onnxruntime as ort
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="ONNX Captcha Recognition")
-
-    parser.add_argument("--model", type=str, default="onnx_model/captcha_ocr.onnx",
-                        help="ONNX model path (all params embedded)")
-    parser.add_argument("--image", type=str, default=None,
-                        help="Single image path")
-    parser.add_argument("--dir", type=str, default=None,
-                        help="Directory containing images")
-    parser.add_argument("--output", type=str, default="outputs/onnx_infer",
-                        help="Output directory")
-    parser.add_argument("--providers", type=str, default="CPUExecutionProvider",
-                        help="ONNX providers")
-    parser.add_argument("--benchmark", action="store_true",
-                        help="Run benchmark")
-    parser.add_argument("--warmup", type=int, default=10,
-                        help="Warmup iterations")
-    parser.add_argument("--iterations", type=int, default=100,
-                        help="Benchmark iterations")
-
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="ONNX Captcha Recognition")
+    p.add_argument("--model", type=str, default="onnx_model/captcha_ocr.onnx")
+    p.add_argument("--image", type=str, default=None)
+    p.add_argument("--dir", type=str, default=None)
+    p.add_argument("--output", type=str, default="outputs/onnx_infer")
+    p.add_argument("--providers", type=str, default="CPUExecutionProvider")
+    p.add_argument("--benchmark", action="store_true")
+    p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--iterations", type=int, default=100)
+    return p.parse_args()
 
 
 class ONNXCaptchaRecognizer:
-    """ONNX-based captcha recognizer with self-contained parameters."""
+    """ONNX captcha recognizer. All parameters from model metadata."""
 
     def __init__(self, model_path: str, provider: str = "CPUExecutionProvider"):
-        # Load ONNX model and extract metadata
-        onnx_model = onnx.load(model_path)
-        metadata = {p.key: p.value for p in onnx_model.metadata_props}
+        meta = {p.key: p.value for p in onnx.load(model_path).metadata_props}
 
-        # Read parameters from model metadata
-        self.character = metadata.get(
-            "character",
-            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-        )
-        self.img_h = int(metadata.get("img_h", 64))
-        self.img_w = int(metadata.get("img_w", 256))
+        self.character = meta.get("character", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+        self.img_h = int(meta.get("img_h", 64))
+        self.img_w = int(meta.get("img_w", 256))
+        self.nc = int(meta.get("nc", 1))
         self.blank = len(self.character)
 
-        # Create inference session
-        providers = [self._get_provider(provider)]
-        self.session = ort.InferenceSession(model_path, providers=providers)
+        prov = 'CUDAExecutionProvider' if 'cuda' in provider.lower() else 'CPUExecutionProvider'
+        self.session = ort.InferenceSession(model_path, providers=[prov])
         self.input_name = self.session.get_inputs()[0].name
 
-        print(f"Loaded ONNX model: {model_path}")
-        print(f"  Image size: {self.img_h}x{self.img_w}")
-        print(f"  Character set: {self.character[:20]}... ({len(self.character)} chars)")
-
-    def _get_provider(self, provider_str: str) -> str:
-        if 'cuda' in provider_str.lower() or 'gpu' in provider_str.lower():
-            return 'CUDAExecutionProvider'
-        return 'CPUExecutionProvider'
+        print(f"Model: {model_path} | {self.img_h}x{self.img_w} nc={self.nc} | {len(self.character)} chars")
 
     def recognize(self, image: np.ndarray) -> Tuple[str, float]:
-        """Run inference on image."""
-        input_tensor = self._preprocess(image)
-
-        start = time.perf_counter()
-        output = self.session.run(None, {self.input_name: input_tensor})[0]
-        latency = (time.perf_counter() - start) * 1000
-
-        pred_indices = output.argmax(axis=1)[0].tolist()
-        text = self._ctc_decode(pred_indices)
-
-        return text, latency
+        tensor = self._preprocess(image)
+        t0 = time.perf_counter()
+        output = self.session.run(None, {self.input_name: tensor})[0]
+        latency = (time.perf_counter() - t0) * 1000
+        return self._decode(output.argmax(axis=1)[0].tolist()), latency
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
-        if len(image.shape) == 3:
-            img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if self.nc == 1:
+            img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+            img = cv2.resize(img, (self.img_w, self.img_h)).astype(np.float32) / 255.0
+            return img[np.newaxis, np.newaxis, ...]    # (1, 1, H, W)
         else:
-            img = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if len(image.shape) == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            img = cv2.resize(img, (self.img_w, self.img_h)).astype(np.float32) / 255.0
+            return np.transpose(img, (2, 0, 1))[np.newaxis, ...]  # (1, 3, H, W)
 
-        img = cv2.resize(img, (self.img_w, self.img_h))
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))
-        img = np.expand_dims(img, axis=0)
-        return img
-
-    def _ctc_decode(self, pred_indices: list) -> str:
-        result = []
-        prev = -1
-        for idx in pred_indices:
-            if idx != prev and idx != self.blank:
-                if idx < len(self.character):
-                    result.append(self.character[idx])
+    def _decode(self, indices: list) -> str:
+        chars, prev = [], -1
+        for idx in indices:
+            if idx != prev and idx != self.blank and idx < len(self.character):
+                chars.append(self.character[idx])
             prev = idx
-        return ''.join(result)
-
-
-def run_benchmark(recognizer: ONNXCaptchaRecognizer, warmup: int, iterations: int):
-    """Run benchmark."""
-    print("\n" + "=" * 60)
-    print("Benchmark Results")
-    print("=" * 60)
-
-    times = []
-    for i in range(warmup + iterations):
-        img = np.random.randint(0, 255, (recognizer.img_h, recognizer.img_w, 3), dtype=np.uint8)
-        start = time.perf_counter()
-        _, _ = recognizer.recognize(img)
-        times.append((time.perf_counter() - start) * 1000)
-
-    times = times[warmup:]
-    avg_time = np.mean(times)
-    std_time = np.std(times)
-
-    print(f"Latency: {avg_time:.2f} ms (+/-{std_time:.2f})")
-    print(f"FPS: {1000 / avg_time:.1f}")
-
-    return {'avg_ms': avg_time, 'std_ms': std_time, 'fps': 1000 / avg_time}
+        return ''.join(chars)
 
 
 def main():
     args = parse_args()
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create output directory
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print("\n" + "=" * 60)
-    print("ONNX Captcha Recognition (Self-Contained Model)")
-    print("=" * 60)
-
-    # Load model (all params embedded in model metadata)
     model_path = Path(args.model)
     if not model_path.exists():
-        print(f"Model not found: {model_path}")
-        return
+        print(f"Model not found: {model_path}"); return
 
-    recognizer = ONNXCaptchaRecognizer(str(model_path), args.providers)
+    rec = ONNXCaptchaRecognizer(str(model_path), args.providers)
 
-    # Benchmark mode
     if args.benchmark:
-        results = run_benchmark(recognizer, args.warmup, args.iterations)
-        json_path = output_dir / "benchmark_results.json"
-        with open(json_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"\nResults saved to: {json_path}")
+        times = []
+        for i in range(args.warmup + args.iterations):
+            img = np.random.randint(0, 255, (rec.img_h, rec.img_w, 3), dtype=np.uint8)
+            _, lat = rec.recognize(img)
+            if i >= args.warmup:
+                times.append(lat)
+        avg, std = np.mean(times), np.std(times)
+        print(f"Benchmark: {avg:.2f}ms +/-{std:.2f}  FPS={1000/avg:.1f}")
+        with open(out_dir / "benchmark.json", 'w') as f:
+            json.dump({'avg_ms': avg, 'std_ms': std, 'fps': 1000/avg}, f, indent=2)
         return
 
-    # Prepare test images
     sources = []
-
     if args.image:
-        img_path = Path(args.image)
-        if img_path.exists():
-            sources = [img_path]
+        p = Path(args.image)
+        if p.exists(): sources = [p]
     elif args.dir:
-        input_dir = Path(args.dir)
-        if input_dir.exists():
-            exts = ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG']
-            for ext in exts:
-                sources.extend(input_dir.glob(ext))
+        d = Path(args.dir)
+        if d.exists():
+            for ext in ('*.png', '*.jpg', '*.jpeg'):
+                sources.extend(d.glob(ext))
     else:
-        # Default test directory
-        test_dir = Path("data/test")
-        if test_dir.exists():
-            exts = ['*.png', '*.jpg', '*.jpeg']
-            for ext in exts:
-                sources.extend(test_dir.glob(ext))
+        d = Path("data/test")
+        if d.exists():
+            for ext in ('*.png', '*.jpg', '*.jpeg'):
+                sources.extend(d.glob(ext))
 
     if not sources:
-        print("No test images found, running benchmark")
-        run_benchmark(recognizer, args.warmup, args.iterations)
-        return
+        print("No images found, running benchmark")
+        args.benchmark = True
+        return main.__wrapped__() if hasattr(main, '__wrapped__') else None
 
-    print(f"\nProcessing {len(sources)} images...")
+    results, total_lat = [], 0.0
+    for p in sources:
+        img = cv2.imread(str(p))
+        if img is None: continue
+        text, lat = rec.recognize(img)
+        total_lat += lat
+        results.append({'image': str(p), 'prediction': text, 'latency_ms': lat})
+        print(f"  {p.name}: {text} ({lat:.1f}ms)")
 
-    # Run inference
-    results = []
-    total_latency = 0.0
+    avg_lat = total_lat / len(results) if results else 0
+    print(f"\n{len(results)} images | avg {avg_lat:.2f}ms | {1000/avg_lat:.1f} FPS" if avg_lat > 0 else "")
 
-    for img_path in sources:
-        img = cv2.imread(str(img_path))
-        if img is None:
-            continue
-
-        text, latency = recognizer.recognize(img)
-        total_latency += latency
-
-        result = {
-            'image': str(img_path),
-            'prediction': text,
-            'latency_ms': latency
-        }
-        results.append(result)
-
-        print(f"  {img_path.name}: {text} ({latency:.2f}ms)")
-
-    # Summary
-    avg_latency = total_latency / len(results) if results else 0
-
-    print("\n" + "=" * 60)
-    print("Summary")
-    print("=" * 60)
-    print(f"Processed: {len(results)} images")
-    print(f"Average latency: {avg_latency:.2f} ms")
-    print(f"FPS: {1000 / avg_latency:.1f}" if avg_latency > 0 else "")
-
-    # Save results
-    json_path = output_dir / "inference_results.json"
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump({
-            'model': str(model_path),
-            'total_images': len(results),
-            'avg_latency_ms': avg_latency,
-            'results': results
-        }, f, indent=2, ensure_ascii=False)
-
-    print(f"Results saved to: {json_path}")
-    print("=" * 60)
+    with open(out_dir / "inference_results.json", 'w', encoding='utf-8') as f:
+        json.dump({'model': str(model_path), 'total': len(results),
+                   'avg_latency_ms': avg_lat, 'results': results}, f, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ class ONNXCaptchaRecognizer:
         self.character = metadata.get("character")
         self.img_h = int(metadata.get("img_h"))
         self.img_w = int(metadata.get("img_w"))
+        self.nc = int(metadata.get("nc", 1))  # Default to grayscale
         self.blank = len(self.character)
 
         # Create inference session
@@ -31,7 +32,7 @@ class ONNXCaptchaRecognizer:
         self.input_name = self.session.get_inputs()[0].name
 
         logger.info(f"------成功加载验证码识别模型: {model_path}---------")
-        logger.info(f"图片大小: {self.img_h}x{self.img_w}")
+        logger.info(f"图片大小: {self.img_h}x{self.img_w} (channels: {self.nc})")
         logger.info(f"验证码字符集: {self.character[:20]}... ({len(self.character)} chars)")
         logger.info(f"使用推理设备: {provider}")
 
@@ -56,21 +57,33 @@ class ONNXCaptchaRecognizer:
 
     def _preprocess(self, image: np.ndarray) -> np.ndarray:
         # 转换为 PIL Image
-        if len(image.shape) == 3:
-            # 已经是 RGB 格式，直接转换
-            img = Image.fromarray(image)
+        if self.nc == 1:
+            # Grayscale mode
+            if len(image.shape) == 3:
+                # RGB to grayscale
+                img = Image.fromarray(image).convert('L')
+            else:
+                img = Image.fromarray(image)
+            # Resize
+            img = img.resize((self.img_w, self.img_h), Image.Resampling.LANCZOS)
+            # Convert to numpy array and normalize
+            img = np.array(img, dtype=np.float32) / 255.0
+            # Add channel dimension (H, W) -> (1, H, W)
+            img = np.expand_dims(img, axis=0)
         else:
-            # 灰度图转 RGB
-            img = Image.fromarray(image).convert('RGB')
+            # RGB mode
+            if len(image.shape) == 3:
+                img = Image.fromarray(image)
+            else:
+                img = Image.fromarray(image).convert('RGB')
+            # Resize
+            img = img.resize((self.img_w, self.img_h), Image.Resampling.LANCZOS)
+            # Convert to numpy array and normalize
+            img = np.array(img, dtype=np.float32) / 255.0
+            # HWC -> CHW
+            img = np.transpose(img, (2, 0, 1))
 
-        # 缩放
-        img = img.resize((self.img_w, self.img_h), Image.Resampling.LANCZOS)
-
-        # 转换为 numpy 数组并归一化
-        img = np.array(img, dtype=np.float32) / 255.0
-        # HWC -> CHW
-        img = np.transpose(img, (2, 0, 1))
-        # 添加 batch 维度
+        # Add batch dimension
         img = np.expand_dims(img, axis=0)
         return img
 
