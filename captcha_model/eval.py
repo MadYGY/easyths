@@ -123,7 +123,11 @@ def main():
     if not os.path.exists(test_dir):
         print(f"Test dir not found: {test_dir}"); sys.exit(1)
 
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model_data = torch.load(model_path, map_location=device, weights_only=True)
+    if model_data.get("model_state_dict"):
+        model.load_state_dict(model_data["model_state_dict"])
+    else:
+        model.load_state_dict(model_data)
 
     test_ds = CaptchaDataset(test_dir, character=character,
                              img_h=img_h, img_w=img_w, nc=nc, augment=False)
