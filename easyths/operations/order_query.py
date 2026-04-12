@@ -109,8 +109,9 @@ class OrderQueryOperation(BaseOperation):
             # 获取剪贴板数据
             table_data = self.get_clipboard_data()
             table_data = text2df(table_data)
-            # 丢弃多余列
-            table_data = table_data.drop(columns=["Unnamed: 12"], errors="ignore")
+            if not table_data.empty:
+                # 丢弃多余列
+                table_data = table_data.drop(columns=["Unnamed: 12"], errors="ignore")
 
             is_op_success = not self.wait_for_pop_dialog(0.2) # 没有弹窗了，说明没有其他意外情况发生
             if is_op_success:

@@ -40,14 +40,20 @@ def df_format_convert(df, format_type):
     """
     将DataFrame格式转换为指定格式
     """
-    if format_type == "markdown":
-        return df.to_markdown()
-    elif format_type == "json" or format_type == "dict":
-        return df.to_dict(orient="records")
-    elif format_type == "str":
-        return df.to_string(index=False)
-    else:
-        return df
+    if df.empty:
+        return {} if format_type in ["json", "dict"] else "空数据"
+    try:
+        if format_type == "markdown":
+            return df.to_markdown()
+        elif format_type == "json" or format_type == "dict":
+            return df.to_dict(orient="records")
+        elif format_type == "str":
+            return df.to_string(index=False)
+        else:
+            return df
+    except Exception as e:
+        logger.error(f"DataFrame格式转换失败: {e}")
+        return  {} if format_type in ["json", dict] else "转换失败"
 
 
 

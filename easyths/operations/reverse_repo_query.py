@@ -110,6 +110,6 @@ class ReverseRepoQueryOperation(BaseOperation):
             self.logger.exception(error_msg)
             return OperationResult(
                 success=False,
-                error=error_msg,
+                message=error_msg,
                 data={"timestamp": time.time()}
             )
